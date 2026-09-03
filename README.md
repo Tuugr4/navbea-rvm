@@ -14,3 +14,7 @@ NVF1 binary stream and publishes sequence-aligned `GRAY8` alpha masks.
 
 Production packages must include the complete GPL-3.0 text, corresponding
 source archive, upstream copyright notices and the exact model checksum.
+
+See `SOURCE_OFFER.md` for corresponding-source access, `CHANGES.md` for the
+modifications surrounding upstream RVM, and `THIRD_PARTY_NOTICES.md` plus
+`SBOM.spdx.json` for the dependency inventory.

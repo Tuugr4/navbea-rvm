@@ -1,10 +1,54 @@
 # Third-party notices
 
+Navbea RVM 1.0.4 is distributed under GPL-3.0-only. The following components
+are included in source or binary distributions. Exact package versions are
+also recorded in `SBOM.spdx.json`.
+
+## Robust Video Matting and model
+
 Robust Video Matting was developed by Shanchuan Lin, Linjie Yang, Imran Saleemi
 and Soumyadip Sengupta and is distributed under GPL-3.0.
 
 - Upstream source: https://github.com/PeterL1n/RobustVideoMatting
-- Paper: Robust High-Resolution Video Matting with Temporal Guidance
+- Pinned release: https://github.com/PeterL1n/RobustVideoMatting/releases/tag/v1.0.0
+- Model: `rvm_mobilenetv3_fp32.onnx`
+- Model SHA-256: `88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828`
+- Full license: `LICENSE`
+- Changes made around the model: `CHANGES.md`
 
-Release automation must update this notice and `models/manifest.json` whenever
-the upstream source or model changes.
+## Bundled diagnostics UI
+
+- React 19.2.0, ReactDOM 19.2.0 and Scheduler 0.27.0 — MIT. License:
+  `THIRD_PARTY_LICENSES/React-ReactDOM-Scheduler-MIT.txt`.
+- @phosphor-icons/react 2.1.10 — MIT. License:
+  `THIRD_PARTY_LICENSES/Phosphor-Icons-MIT.txt`.
+- Electron 43.4.0 — MIT, with Chromium and other notices. Packaged Windows
+  distributions include `LICENSE` and `LICENSES.chromium.html` beside the
+  executable.
+
+## Local-media protocol
+
+The vendored `@navbea/local-media-protocol` implementation is MIT licensed.
+Its license is at `local-media-protocol/LICENSE`.
+
+## Hermetic Python runtime
+
+The package preserves license and metadata files from every installed wheel.
+The principal components are:
+
+- Python 3.12 — PSF-2.0; `runtime/LICENSE.txt`.
+- ONNX Runtime / ONNX Runtime DirectML 1.24.4 — MIT;
+  `runtime/Lib/site-packages/onnxruntime/LICENSE` and
+  `runtime/Lib/site-packages/onnxruntime/ThirdPartyNotices.txt`.
+- NumPy 2.5.2 — BSD-3-Clause and bundled compatible notices;
+  `runtime/Lib/site-packages/numpy-2.5.2.dist-info/licenses/`.
+- Pillow 12.3.0 — MIT-CMU;
+  `runtime/Lib/site-packages/pillow-12.3.0.dist-info/licenses/`.
+- FlatBuffers 25.12.19 — Apache-2.0.
+- Packaging 26.3 — Apache-2.0 OR BSD-2-Clause.
+- Protobuf 7.36.1 — BSD-3-Clause.
+- SymPy 1.14.0 and mpmath 1.3.0 — BSD-style licenses.
+- pip 25.0.1 — MIT.
+
+These components are unmodified dependencies. Their original license and
+notice files remain inside the hermetic runtime distribution.

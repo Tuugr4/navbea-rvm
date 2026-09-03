@@ -1,0 +1,42 @@
+{
+  "spdxVersion": "SPDX-2.3",
+  "dataLicense": "CC0-1.0",
+  "SPDXID": "SPDXRef-DOCUMENT",
+  "name": "Navbea-RVM-1.0.4",
+  "documentNamespace": "https://github.com/Tuugr4/navbea-rvm/sbom/1.0.4",
+  "creationInfo": {"created":"2026-09-03T00:00:00Z","creators":["Organization: Navbea"]},
+  "packages": [
+    {"name":"Navbea RVM","SPDXID":"SPDXRef-Package-NavbeaRVM","versionInfo":"1.0.4","downloadLocation":"https://github.com/Tuugr4/navbea-rvm","filesAnalyzed":false,"licenseConcluded":"GPL-3.0-only","licenseDeclared":"GPL-3.0-only","copyrightText":"NOASSERTION"},
+    {"name":"Robust Video Matting MobileNetV3 ONNX","SPDXID":"SPDXRef-Package-RVMModel","versionInfo":"1.0.0","downloadLocation":"https://github.com/PeterL1n/RobustVideoMatting/releases/tag/v1.0.0","filesAnalyzed":false,"licenseConcluded":"GPL-3.0-only","licenseDeclared":"GPL-3.0-only","copyrightText":"Copyright Shanchuan Lin, Linjie Yang, Imran Saleemi and Soumyadip Sengupta","checksums":[{"algorithm":"SHA256","checksumValue":"88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828"}]},
+    {"name":"@navbea/local-media-protocol","SPDXID":"SPDXRef-Package-LocalMediaProtocol","versionInfo":"1.0.0","downloadLocation":"NOASSERTION","filesAnalyzed":false,"licenseConcluded":"MIT","licenseDeclared":"MIT","copyrightText":"Copyright 2026 Navbea"},
+    {"name":"Electron","SPDXID":"SPDXRef-Package-Electron","versionInfo":"43.4.0","downloadLocation":"https://github.com/electron/electron","filesAnalyzed":false,"licenseConcluded":"MIT","licenseDeclared":"MIT","copyrightText":"NOASSERTION"},
+    {"name":"React","SPDXID":"SPDXRef-Package-React","versionInfo":"19.2.0","downloadLocation":"https://github.com/facebook/react","filesAnalyzed":false,"licenseConcluded":"MIT","licenseDeclared":"MIT","copyrightText":"Copyright Meta Platforms, Inc. and affiliates"},
+    {"name":"ReactDOM","SPDXID":"SPDXRef-Package-ReactDOM","versionInfo":"19.2.0","downloadLocation":"https://github.com/facebook/react","filesAnalyzed":false,"licenseConcluded":"MIT","licenseDeclared":"MIT","copyrightText":"Copyright Meta Platforms, Inc. and affiliates"},
+    {"name":"Scheduler","SPDXID":"SPDXRef-Package-Scheduler","versionInfo":"0.27.0","downloadLocation":"https://github.com/facebook/react","filesAnalyzed":false,"licenseConcluded":"MIT","licenseDeclared":"MIT","copyrightText":"Copyright Meta Platforms, Inc. and affiliates"},
+    {"name":"@phosphor-icons/react","SPDXID":"SPDXRef-Package-Phosphor","versionInfo":"2.1.10","downloadLocation":"https://github.com/phosphor-icons/react","filesAnalyzed":false,"licenseConcluded":"MIT","licenseDeclared":"MIT","copyrightText":"Copyright 2020 Phosphor Icons"},
+    {"name":"Python","SPDXID":"SPDXRef-Package-Python","versionInfo":"3.12","downloadLocation":"https://www.python.org/","filesAnalyzed":false,"licenseConcluded":"PSF-2.0","licenseDeclared":"PSF-2.0","copyrightText":"Copyright Python Software Foundation"},
+    {"name":"onnxruntime-directml","SPDXID":"SPDXRef-Package-ONNXRuntime","versionInfo":"1.24.4","downloadLocation":"https://pypi.org/project/onnxruntime-directml/1.24.4/","filesAnalyzed":false,"licenseConcluded":"MIT","licenseDeclared":"MIT","copyrightText":"Copyright Microsoft Corporation"},
+    {"name":"NumPy","SPDXID":"SPDXRef-Package-NumPy","versionInfo":"2.5.2","downloadLocation":"https://pypi.org/project/numpy/2.5.2/","filesAnalyzed":false,"licenseConcluded":"BSD-3-Clause","licenseDeclared":"BSD-3-Clause","copyrightText":"NOASSERTION"},
+    {"name":"Pillow","SPDXID":"SPDXRef-Package-Pillow","versionInfo":"12.3.0","downloadLocation":"https://pypi.org/project/pillow/12.3.0/","filesAnalyzed":false,"licenseConcluded":"MIT-CMU","licenseDeclared":"MIT-CMU","copyrightText":"NOASSERTION"},
+    {"name":"flatbuffers","SPDXID":"SPDXRef-Package-FlatBuffers","versionInfo":"25.12.19","downloadLocation":"https://pypi.org/project/flatbuffers/25.12.19/","filesAnalyzed":false,"licenseConcluded":"Apache-2.0","licenseDeclared":"Apache-2.0","copyrightText":"NOASSERTION"},
+    {"name":"packaging","SPDXID":"SPDXRef-Package-Packaging","versionInfo":"26.3","downloadLocation":"https://pypi.org/project/packaging/26.3/","filesAnalyzed":false,"licenseConcluded":"Apache-2.0 OR BSD-2-Clause","licenseDeclared":"Apache-2.0 OR BSD-2-Clause","copyrightText":"NOASSERTION"},
+    {"name":"protobuf","SPDXID":"SPDXRef-Package-Protobuf","versionInfo":"7.36.1","downloadLocation":"https://pypi.org/project/protobuf/7.36.1/","filesAnalyzed":false,"licenseConcluded":"BSD-3-Clause","licenseDeclared":"BSD-3-Clause","copyrightText":"Copyright Google LLC"},
+    {"name":"SymPy","SPDXID":"SPDXRef-Package-SymPy","versionInfo":"1.14.0","downloadLocation":"https://pypi.org/project/sympy/1.14.0/","filesAnalyzed":false,"licenseConcluded":"BSD-3-Clause","licenseDeclared":"BSD-3-Clause","copyrightText":"NOASSERTION"},
+    {"name":"mpmath","SPDXID":"SPDXRef-Package-mpmath","versionInfo":"1.3.0","downloadLocation":"https://pypi.org/project/mpmath/1.3.0/","filesAnalyzed":false,"licenseConcluded":"BSD-3-Clause","licenseDeclared":"BSD-3-Clause","copyrightText":"NOASSERTION"},
+    {"name":"pip","SPDXID":"SPDXRef-Package-pip","versionInfo":"25.0.1","downloadLocation":"https://pypi.org/project/pip/25.0.1/","filesAnalyzed":false,"licenseConcluded":"MIT","licenseDeclared":"MIT","copyrightText":"Copyright The pip developers"}
+  ],
+  "relationships": [
+    {"spdxElementId":"SPDXRef-DOCUMENT","relationshipType":"DESCRIBES","relatedSpdxElement":"SPDXRef-Package-NavbeaRVM"},
+    {"spdxElementId":"SPDXRef-Package-NavbeaRVM","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-RVMModel"},
+    {"spdxElementId":"SPDXRef-Package-NavbeaRVM","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-LocalMediaProtocol"},
+    {"spdxElementId":"SPDXRef-Package-NavbeaRVM","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-Electron"},
+    {"spdxElementId":"SPDXRef-Package-NavbeaRVM","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-React"},
+    {"spdxElementId":"SPDXRef-Package-NavbeaRVM","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-ReactDOM"},
+    {"spdxElementId":"SPDXRef-Package-NavbeaRVM","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-Scheduler"},
+    {"spdxElementId":"SPDXRef-Package-NavbeaRVM","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-Phosphor"},
+    {"spdxElementId":"SPDXRef-Package-NavbeaRVM","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-Python"},
+    {"spdxElementId":"SPDXRef-Package-NavbeaRVM","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-ONNXRuntime"},
+    {"spdxElementId":"SPDXRef-Package-NavbeaRVM","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-NumPy"},
+    {"spdxElementId":"SPDXRef-Package-NavbeaRVM","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-Pillow"}
+  ]
+}

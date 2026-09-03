@@ -1,6 +1,6 @@
 {
   "name": "navbea-rvm",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "private": false,
   "description": "GPL-3.0 local Robust Video Matting service and diagnostics application",
   "license": "GPL-3.0-only",
@@ -13,6 +13,7 @@
     "build": "tsc --noEmit && vite build",
     "test": "node --test service/*.test.cjs && node scripts/test-worker.mjs",
     "electron:make": "npm run build && electron-forge make",
+    "source:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-corresponding-source.ps1",
     "release:verify": "node scripts/verify-release.mjs"
   },
   "dependencies": {

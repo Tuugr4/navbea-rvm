@@ -3,5 +3,13 @@
   "upstream": "https://github.com/PeterL1n/RobustVideoMatting/releases/tag/v1.0.0",
   "license": "GPL-3.0-only",
   "sha256": "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828",
+  "upstreamSource": {
+    "file": "RobustVideoMatting-v1.0.0-source.zip",
+    "sha256": "b58b1187fb9373f56db2e463a7629cf9f539c4c97ea361c793620396211122da"
+  },
+  "upstreamCheckpoint": {
+    "file": "rvm_mobilenetv3.pth",
+    "sha256": "3c7c1d92033f7c38d6577c481d13a195d7d80a159b960f4f3119ac7b534cf4f8"
+  },
   "bundled": false
 }

@@ -31,6 +31,7 @@ if (serviceMode) {
 if (process.platform === "win32") app.setAppUserModelId("com.navbea.RVM");
 app.setPath("userData", path.join(app.getPath("appData"), "Navbea", "RVM"));
 function root() { return process.env.NAVBEA_RVM_DATA_DIR || (process.platform === "win32" ? path.join(process.env.PROGRAMDATA || "C:\\ProgramData", "Navbea", "RVM") : "/var/lib/navbea/rvm"); }
+function resource(name) { return app.isPackaged ? path.join(process.resourcesPath, name) : path.join(__dirname, "..", name); }
 async function health() {
   const token = (await fs.readFile(path.join(root(), "client-token.txt"), "utf8")).trim();
   return new Promise((resolve, reject) => { const req = http.request({ socketPath: endpointPaths("rvm", process.platform, process.env).control, method: "GET", path: "/v1/health", headers: { "x-navbea-client-token": token } }, res => { const chunks = []; res.on("data", chunk => chunks.push(chunk)); res.on("end", () => resolve(JSON.parse(Buffer.concat(chunks).toString()))); }); req.on("error", reject); req.end(); });
@@ -38,6 +39,10 @@ async function health() {
 function createWindow() { const win = new BrowserWindow({ width: 1100, height: 760, minWidth: 860, minHeight: 600, show: false, backgroundColor: "#061426", autoHideMenuBar: true, webPreferences: { preload: path.join(__dirname, "preload.cjs"), nodeIntegration: false, contextIsolation: true, sandbox: true } }); win.once("ready-to-show", () => win.show()); if (process.env.VITE_DEV_SERVER_URL) win.loadURL(process.env.VITE_DEV_SERVER_URL); else win.loadFile(path.join(__dirname, "..", "dist", "index.html")); }
 app.whenReady().then(createWindow); app.on("window-all-closed", () => app.quit());
 ipcMain.handle("rvm:health", health);
-ipcMain.handle("rvm:open-source", () => shell.openExternal("https://github.com/PeterL1n/RobustVideoMatting"));
+ipcMain.handle("rvm:open-source", () => shell.openExternal("https://github.com/Tuugr4/navbea-rvm/releases/tag/v1.0.4"));
+ipcMain.handle("rvm:open-upstream", () => shell.openExternal("https://github.com/PeterL1n/RobustVideoMatting"));
+ipcMain.handle("rvm:open-license", () => shell.openPath(resource("LICENSE")));
+ipcMain.handle("rvm:open-notices", () => shell.openPath(resource("THIRD_PARTY_NOTICES.md")));
+ipcMain.handle("rvm:open-source-offer", () => shell.openPath(resource("SOURCE_OFFER.md")));
 ipcMain.handle("rvm:open-data", () => shell.openPath(root()));
 }

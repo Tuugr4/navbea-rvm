@@ -5,7 +5,7 @@ module.exports = {
   outDir: process.env.NAVBEA_RVM_FORGE_OUT || "out",
   packagerConfig: {
     asar: true, name: "Navbea RVM", executableName: "navbea-rvm",
-    extraResource: ["service", "worker", "models", "deploy", "local-media-protocol", "LICENSE", "THIRD_PARTY_NOTICES.md", runtimeSource, modelSource].filter(Boolean),
+    extraResource: ["service", "worker", "models", "deploy", "local-media-protocol", "THIRD_PARTY_LICENSES", "LICENSE", "THIRD_PARTY_NOTICES.md", "SOURCE_OFFER.md", "CHANGES.md", "SBOM.spdx.json", runtimeSource, modelSource].filter(Boolean),
   },
   makers: [
     { name: "@electron-forge/maker-squirrel", platforms: ["win32"], config: { name: "NavbeaRVM", setupExe: "Navbea-RVM-Setup.exe" } },

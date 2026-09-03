@@ -17,7 +17,7 @@ function loadProtocol() {
 }
 const { Codec, FrameDecoder, MessageType, encodeFrame, endpointPaths, signCapability, verifyCapability } = loadProtocol();
 
-const VERSION = "1.0.3";
+const VERSION = "1.0.4";
 const API_VERSION = "1.0";
 const MAX_CONTROL_BODY = 64 * 1024;
 
