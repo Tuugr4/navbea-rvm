@@ -1,0 +1,7 @@
+{
+  "model": "rvm_mobilenetv3_fp32.onnx",
+  "upstream": "https://github.com/PeterL1n/RobustVideoMatting/releases/tag/v1.0.0",
+  "license": "GPL-3.0-only",
+  "sha256": "88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828",
+  "bundled": false
+}

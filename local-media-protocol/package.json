@@ -1,0 +1,9 @@
+{
+  "name": "@navbea/local-media-protocol",
+  "version": "1.0.0",
+  "description": "Vendored local-only media protocol used by Navbea RVM",
+  "license": "MIT",
+  "type": "commonjs",
+  "main": "index.cjs",
+  "files": ["index.cjs", "README.md", "LICENSE"]
+}

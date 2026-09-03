@@ -1,0 +1,38 @@
+{
+  "name": "navbea-rvm",
+  "version": "1.0.3",
+  "private": false,
+  "description": "GPL-3.0 local Robust Video Matting service and diagnostics application",
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite --port 4176 --strictPort",
+    "service:dev": "cross-env NAVBEA_RVM_DEV=1 NAVBEA_RVM_FIXTURE=1 NAVBEA_RUNTIME_DIR=.runtime/run NAVBEA_CAMERA_DATA_DIR=.runtime/camera-data NAVBEA_RVM_DATA_DIR=.runtime/data NAVBEA_CAMERA_CLIENT_TOKEN=development-camera-token-000000000000000000000000 node service/main.cjs",
+    "electron:dev": "concurrently -k \"vite --port 4176 --strictPort\" \"npm run service:dev\" \"wait-on http://127.0.0.1:4176 && cross-env NAVBEA_RVM_DEV=1 NAVBEA_RUNTIME_DIR=.runtime/run NAVBEA_RVM_DATA_DIR=.runtime/data VITE_DEV_SERVER_URL=http://127.0.0.1:4176 electron-forge start\"",
+    "build": "tsc --noEmit && vite build",
+    "test": "node --test service/*.test.cjs && node scripts/test-worker.mjs",
+    "electron:make": "npm run build && electron-forge make",
+    "release:verify": "node scripts/verify-release.mjs"
+  },
+  "dependencies": {
+    "@phosphor-icons/react": "^2.1.10",
+    "react": "19.2.0",
+    "react-dom": "19.2.0"
+  },
+  "devDependencies": {
+    "@electron-forge/cli": "^7.11.2",
+    "@electron-forge/maker-deb": "^7.11.2",
+    "@electron-forge/maker-squirrel": "^7.11.2",
+    "@electron-forge/maker-zip": "^7.11.2",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "5.0.4",
+    "concurrently": "^10.0.5",
+    "cross-env": "^10.1.0",
+    "electron": "^43.4.0",
+    "typescript": "^7.0.2",
+    "vite": "6.4.3",
+    "wait-on": "^9.1.0"
+  }
+}
