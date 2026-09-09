@@ -1,6 +1,6 @@
 {
   "name": "navbea-rvm",
-  "version": "1.0.4",
+  "version": "1.0.5-local",
   "private": false,
   "description": "GPL-3.0 local Robust Video Matting service and diagnostics application",
   "license": "GPL-3.0-only",

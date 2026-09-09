@@ -22,7 +22,7 @@ if (serviceMode) {
   // DirectML requires an interactive session. The machine-wide task runs at
   // higher integrity than Kiosk; HMAC tokens remain mandatory on the shared pipe.
   process.env.NAVBEA_PIPE_READABLE_ALL ||= "1";
-  process.env.RVM_DEVICE ||= "auto";
+  process.env.RVM_DEVICE ||= "cpu";
   const { RvmService } = require(path.join(process.resourcesPath, "service", "rvm-service.cjs"));
   const rvmService = new RvmService();
   rvmService.start().catch(error => { console.error(JSON.stringify({ level: "fatal", service: "rvm", error: error.message })); process.exitCode = 1; });
@@ -39,7 +39,7 @@ async function health() {
 function createWindow() { const win = new BrowserWindow({ width: 1100, height: 760, minWidth: 860, minHeight: 600, show: false, backgroundColor: "#061426", autoHideMenuBar: true, webPreferences: { preload: path.join(__dirname, "preload.cjs"), nodeIntegration: false, contextIsolation: true, sandbox: true } }); win.once("ready-to-show", () => win.show()); if (process.env.VITE_DEV_SERVER_URL) win.loadURL(process.env.VITE_DEV_SERVER_URL); else win.loadFile(path.join(__dirname, "..", "dist", "index.html")); }
 app.whenReady().then(createWindow); app.on("window-all-closed", () => app.quit());
 ipcMain.handle("rvm:health", health);
-ipcMain.handle("rvm:open-source", () => shell.openExternal("https://github.com/Tuugr4/navbea-rvm/releases/tag/v1.0.4"));
+ipcMain.handle("rvm:open-source", () => app.getVersion().includes("-local") && app.isPackaged ? shell.openPath(resource("source")) : shell.openExternal("https://github.com/Tuugr4/navbea-rvm/releases/tag/v1.0.4"));
 ipcMain.handle("rvm:open-upstream", () => shell.openExternal("https://github.com/PeterL1n/RobustVideoMatting"));
 ipcMain.handle("rvm:open-license", () => shell.openPath(resource("LICENSE")));
 ipcMain.handle("rvm:open-notices", () => shell.openPath(resource("THIRD_PARTY_NOTICES.md")));

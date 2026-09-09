@@ -6,6 +6,7 @@ const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const { resolveCpuProfile } = require("./cpu-profile.cjs");
 
 function loadProtocol() {
   const candidates = [
@@ -17,8 +18,8 @@ function loadProtocol() {
 }
 const { Codec, FrameDecoder, MessageType, encodeFrame, endpointPaths, signCapability, verifyCapability } = loadProtocol();
 
-const VERSION = "1.0.4";
-const API_VERSION = "1.0";
+const VERSION = "1.0.5-local";
+const API_VERSION = "1.1";
 const MAX_CONTROL_BODY = 64 * 1024;
 
 function writeLatestBounded(subscriber, encoded, onBackpressure = () => undefined) {
@@ -59,9 +60,10 @@ class PythonWorker {
   }
   start() {
     const args = [this.options.script, "--model", this.options.model, "--device", this.options.device || "auto"];
+    args.push("--downsample-ratio", String(this.options.liveRatio ?? 0.375), "--still-ratio", String(this.options.stillRatio ?? 0.5), "--threads", String(this.options.threads ?? 0));
     this.child = spawn(this.options.python, args, { windowsHide: true, shell: false, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PYTHONUNBUFFERED: "1" } });
     this.child.stdout.on("data", chunk => {
-      try { for (const frame of this.decoder.push(chunk)) { const key = frame.sequence.toString(); this.pending.get(key)?.resolve(frame); this.pending.delete(key); this.onMask?.(frame); } }
+      try { for (const frame of this.decoder.push(chunk)) { const key = frame.sequence.toString(); const pending = this.pending.get(key); pending?.resolve(frame); this.pending.delete(key); if (pending && !pending.native) this.onMask?.(frame); } }
       catch (error) { this.failPending(error); this.onFailure?.(error); this.child?.kill(); }
     });
     this.child.stderr.on("data", chunk => { const line = `${new Date().toISOString()} ${chunk.toString()}\n`; if (this.options.logPath) try { fs.appendFileSync(this.options.logPath, line); } catch {} });
@@ -87,8 +89,10 @@ class PythonWorker {
     if (this.pending.size >= 2) return Promise.reject(new Error("RVM worker backpressure"));
     const key = frame.sequence.toString();
     return new Promise((resolve, reject) => {
-      const fail = error => { if (!this.pending.has(key)) return; this.pending.delete(key); reject(error); };
-      this.pending.set(key, { resolve, reject, started: process.hrtime.bigint() });
+      const fail = error => { const pending = this.pending.get(key); if (!pending) return; this.pending.delete(key); pending.reject(error); };
+      const timeout = setTimeout(() => { const error = new Error("RVM inference timed out"); fail(error); this.onFailure?.(error); child.kill(); }, frame.flags & 1 ? 60_000 : 10_000);
+      const settle = callback => value => { clearTimeout(timeout); callback(value); };
+      this.pending.set(key, { resolve: settle(resolve), reject: settle(reject), native: Boolean(frame.flags & 1), started: process.hrtime.bigint() });
       const encoded = encodeFrame({ ...frame, codec: Codec.MJPEG, type: MessageType.FRAME });
       if (this.options.debugDir && this.pending.size <= 2) try { fs.mkdirSync(this.options.debugDir, { recursive: true }); fs.writeFileSync(path.join(this.options.debugDir, `input-${key}.nvf1`), encoded); } catch {}
       try { child.stdin.write(encoded, error => { if (error) fail(error); }); }
@@ -109,7 +113,7 @@ class RvmService {
     this.sessions = new Map(); this.subscribers = new Set(); this.artifacts = new Map(); this.startedAt = Date.now();
     this.status = "starting"; this.errorCode = null; this.error = null; this.sourceSession = null;
     this.metrics = { frames: 0, dropped: 0, inferenceMs: null, maskFps: 0, device: this.env.RVM_DEVICE || "auto" }; this.stopping = false; this.workerRestartTimer = null; this.stillCaptureBusy = false;
-    this.sequenceTimes = new Map();
+    this.sequenceTimes = new Map(); this.latestSourceFrame = null;
   }
   async ensureStorage() {
     await fsp.mkdir(this.dataRoot, { recursive: true, mode: 0o700 });
@@ -123,13 +127,22 @@ class RvmService {
     const first = values => values.find(value => value && fs.existsSync(value)) || values.filter(Boolean)[0];
     const python = this.env.RVM_PYTHON_PATH || first(this.platform === "win32" ? [path.join(packagedRoot, "runtime", "python.exe"), path.join(packagedRoot, "runtime", "Scripts", "python.exe"), path.join(packagedRoot, ".runtime-build", "Scripts", "python.exe"), path.join(packagedRoot, ".venv", "Scripts", "python.exe")] : [path.join(packagedRoot, "runtime", "bin", "python"), path.join(packagedRoot, ".runtime-build", "bin", "python"), path.join(packagedRoot, ".venv", "bin", "python")]);
     const model = this.env.RVM_MODEL_PATH || first([path.join(packagedRoot, "models", "rvm_mobilenetv3_fp32.onnx"), path.join(packagedRoot, "rvm_mobilenetv3_fp32.onnx"), path.join(packagedRoot, "models", "rvm_mobilenetv3_fp32.torchscript"), path.join(packagedRoot, "rvm_mobilenetv3_fp32.torchscript")]);
-    return { python, script: path.join(packagedRoot, "worker", "rvm_worker.py"), model, device: this.env.RVM_DEVICE || "auto", logPath: path.join(this.dataRoot, "worker.log"), debugDir: this.env.RVM_DEBUG_FRAME_DIR || "" };
+    return { python, script: path.join(packagedRoot, "worker", "rvm_worker.py"), model, device: this.env.RVM_DEVICE || "cpu", liveRatio: Number(this.env.RVM_LIVE_RATIO || 0.375), stillRatio: Number(this.env.RVM_STILL_RATIO || 0.5), threads: this.env.RVM_CPU_THREADS || "auto", logPath: path.join(this.dataRoot, "worker.log"), debugDir: this.env.RVM_DEBUG_FRAME_DIR || "" };
   }
   async startWorker() {
+    if (this.stopping) return;
     if (this.fixture) { this.status = "ready"; this.metrics.device = "fixture"; return; }
     const options = this.workerOptions();
     for (const target of [options.python, options.script, options.model]) await fsp.access(target);
-    this.worker = new PythonWorker(options); this.worker.onMask = frame => this.acceptMask(frame); this.worker.onFailure = error => { this.status = "unavailable"; this.errorCode = "RVM_WORKER_PIPE_FAILED"; this.error = error.message; }; this.worker.onExit = code => { this.status = "unavailable"; this.errorCode = "RVM_WORKER_EXITED"; this.error = `RVM worker exited (${code})`; this.worker = null; if (!this.stopping) this.workerRestartTimer = setTimeout(() => this.startWorker().catch(error => { this.error = error.message; }), 1000); }; await this.worker.start(); this.status = "ready"; this.errorCode = null; this.error = null;
+    this.status = "starting";
+    this.metrics.threadMode = "calibrating";
+    const profile = await resolveCpuProfile(options, this.dataRoot);
+    if (this.stopping) return;
+    options.threads = profile.threads;
+    this.metrics.threads = profile.threads; this.metrics.threadMode = profile.mode;
+    this.metrics.availableProcessors = profile.cpu.available; this.metrics.physicalCores = profile.cpu.physical;
+    this.metrics.device = options.device;
+    this.worker = new PythonWorker(options); this.worker.onMask = frame => this.acceptMask(frame); this.worker.onFailure = error => { this.status = "unavailable"; this.errorCode = "RVM_WORKER_PIPE_FAILED"; this.error = error.message; }; this.worker.onExit = code => { this.status = "unavailable"; this.errorCode = "RVM_WORKER_EXITED"; this.error = `RVM worker exited (${code})`; this.worker = null; if (!this.stopping) this.workerRestartTimer = setTimeout(() => this.startWorker().catch(error => { this.error = error.message; }), 1000); }; await this.worker.start(); if (this.stopping) { this.worker?.stop(); this.worker = null; return; } this.status = "ready"; this.errorCode = null; this.error = null;
   }
   cameraRequest(method, pathname, body, authorization) {
     const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
@@ -159,7 +172,10 @@ class RvmService {
     socket.on("error", error => { if (this.cameraSocket !== socket) return; this.error = error.message; this.status = "unavailable"; this.errorCode = "CAMERA_STREAM_FAILED"; });
   }
   async processSourceFrame(frame) {
-    if (this.stillCaptureBusy || this.sequenceTimes.size >= 2) { this.metrics.dropped += 1; return; }
+    // Admit only one live inference. A second queued frame adds a full CPU
+    // inference interval to mask latency without increasing throughput.
+    if (this.stillCaptureBusy) { this.metrics.dropped += 1; return; }
+    if (this.sequenceTimes.size >= 1) { if (this.latestSourceFrame) this.metrics.dropped += 1; this.latestSourceFrame = frame; return; }
     const started = process.hrtime.bigint(); this.sequenceTimes.set(frame.sequence.toString(), started);
     if (this.fixture) {
       const width = 1280, height = 720;
@@ -167,11 +183,12 @@ class RvmService {
       return;
     }
     try { if (!this.worker) throw new Error("RVM worker is not running"); await this.worker.process(frame); } catch (error) { this.sequenceTimes.delete(frame.sequence.toString()); this.metrics.dropped += 1; this.error = error.message; if (!this.worker || /not running|EPIPE|EOF|closed/i.test(error.message)) { this.status = "unavailable"; this.errorCode = "RVM_WORKER_PIPE_FAILED"; } }
+    finally { const latest = this.latestSourceFrame; this.latestSourceFrame = null; if (latest && !this.stillCaptureBusy && !this.stopping && this.cameraSocket) void this.processSourceFrame(latest); }
   }
   acceptMask(frame) {
     const key = frame.sequence.toString(); const started = this.sequenceTimes.get(key); this.sequenceTimes.delete(key);
     if (started) this.metrics.inferenceMs = Number(process.hrtime.bigint() - started) / 1e6;
-    this.metrics.frames += 1; this.status = "ready"; this.errorCode = null;
+    this.metrics.frames += 1; this.status = "ready"; this.errorCode = null; this.error = null;
     const now = Date.now(); this.metrics.windowStarted ||= now; this.metrics.windowFrames = (this.metrics.windowFrames || 0) + 1;
     if (now - this.metrics.windowStarted >= 1000) { this.metrics.maskFps = Math.round(this.metrics.windowFrames * 1000 / (now - this.metrics.windowStarted)); this.metrics.windowStarted = now; this.metrics.windowFrames = 0; }
     for (const subscriber of this.subscribers) this.sendMask(subscriber, frame);
@@ -181,7 +198,7 @@ class RvmService {
     const encoded = encodeFrame({ type: MessageType.FRAME, codec: Codec.GRAY8, streamId: subscriber.streamId, sequence: frame.sequence, monotonicNs: frame.monotonicNs, width: frame.width, height: frame.height, payload: frame.payload });
     writeLatestBounded(subscriber, encoded, () => { this.metrics.dropped += 1; });
   }
-  health() { return { status: this.status, service: "rvm", version: VERSION, apiVersion: API_VERSION, uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000), errorCode: this.errorCode, error: this.error, sourceSession: this.sourceSession?.id || null, metrics: { frames: this.metrics.frames, dropped: this.metrics.dropped, maskFps: this.metrics.maskFps, inferenceMs: this.metrics.inferenceMs === null ? null : Number(this.metrics.inferenceMs.toFixed(2)), device: this.metrics.device } }; }
+  health() { return { status: this.status, service: "rvm", version: VERSION, apiVersion: API_VERSION, uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000), errorCode: this.errorCode, error: this.error, sourceSession: this.sourceSession?.id || null, metrics: { frames: this.metrics.frames, dropped: this.metrics.dropped, maskFps: this.metrics.maskFps, inferenceMs: this.metrics.inferenceMs === null ? null : Number(this.metrics.inferenceMs.toFixed(2)), device: this.metrics.device, threads: this.metrics.threads ?? null, threadMode: this.metrics.threadMode ?? null, availableProcessors: this.metrics.availableProcessors ?? null, physicalCores: this.metrics.physicalCores ?? null } }; }
   authorized(req) { const a = Buffer.from(String(req.headers["x-navbea-client-token"] || "")); const b = Buffer.from(String(this.clientSecret)); return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b); }
   async createSession() {
     if (this.status !== "ready") throw new Error("RVM is not ready"); await this.ensureCameraSource();
@@ -191,15 +208,16 @@ class RvmService {
     this.sessions.set(id, item); setTimeout(() => this.sessions.delete(id), 125_000).unref?.(); return item;
   }
   async resetPipeline() {
-    const cameraSocket = this.cameraSocket; this.cameraSocket = null; this.sourceSession = null; cameraSocket?.destroy(); this.sequenceTimes.clear();
+    const cameraSocket = this.cameraSocket; this.cameraSocket = null; this.sourceSession = null; cameraSocket?.destroy(); this.sequenceTimes.clear(); this.latestSourceFrame = null;
     if (!this.fixture) { this.worker?.stop(); this.worker = null; await this.startWorker(); }
   }
   async stillMatte(cameraArtifact) {
     const response = await this.cameraRequest("GET", `/v1/artifacts/${cameraArtifact.id}`, undefined, `Bearer ${cameraArtifact.rvmReadCapability}`);
     const sequence = BigInt(Date.now()); const streamId = crypto.randomUUID();
-    const source = { type: MessageType.FRAME, flags: 1, codec: Codec.JPEG, streamId, sequence, monotonicNs: process.hrtime.bigint(), width: cameraArtifact.width || 0, height: cameraArtifact.height || 0, payload: response.data };
+    const source = { type: MessageType.FRAME, flags: 3, codec: Codec.JPEG, streamId, sequence, monotonicNs: process.hrtime.bigint(), width: cameraArtifact.width || 0, height: cameraArtifact.height || 0, payload: response.data };
     let mask;
     this.stillCaptureBusy = true;
+    this.latestSourceFrame = null;
     try {
       if (this.fixture) mask = { ...source, width: cameraArtifact.width || 1920, height: cameraArtifact.height || 1080, payload: Buffer.alloc((cameraArtifact.width || 1920) * (cameraArtifact.height || 1080), 255) };
       else {
@@ -209,10 +227,22 @@ class RvmService {
         mask = await this.worker.process(source);
       }
     } finally { this.stillCaptureBusy = false; }
+    let foregroundArtifact;
+    if (mask.codec === 5) {
+      const maskLength = mask.payload.readUInt32BE(0);
+      if (maskLength !== mask.width * mask.height || mask.payload.length <= 4 + maskLength) throw new Error("Invalid native foreground response");
+      const payload = mask.payload.subarray(4 + maskLength);
+      const id = crypto.randomUUID(), exp = Math.floor(Date.now() / 1000) + 120;
+      foregroundArtifact = { id, width: mask.width, height: mask.height, byteLength: payload.length, mimeType: "image/jpeg", expiresAt: new Date(exp * 1000).toISOString(), readCapability: signCapability({ aud: "rvm", scope: "artifact:read", artifact: id, exp }, this.capabilitySecret) };
+      this.artifacts.set(id, { ...foregroundArtifact, payload });
+      setTimeout(() => this.artifacts.delete(id), 125_000).unref?.();
+      mask = { ...mask, codec: Codec.GRAY8, payload: mask.payload.subarray(4, 4 + maskLength) };
+    }
+    if (mask.payload.length !== mask.width * mask.height) throw new Error("Invalid native mask length");
     const id = crypto.randomUUID(), exp = Math.floor(Date.now() / 1000) + 120;
     const artifact = { id, payload: mask.payload, width: mask.width, height: mask.height, byteLength: mask.payload.length, mimeType: "application/x-navbea-gray8", expiresAt: new Date(exp * 1000).toISOString() };
     artifact.readCapability = signCapability({ aud: "rvm", scope: "artifact:read", artifact: id, exp }, this.capabilitySecret);
-    this.artifacts.set(id, artifact); setTimeout(() => this.artifacts.delete(id), 125_000).unref?.(); const { payload: _payload, ...publicItem } = artifact; return publicItem;
+    this.artifacts.set(id, artifact); setTimeout(() => this.artifacts.delete(id), 125_000).unref?.(); const { payload: _payload, ...publicItem } = artifact; return { ...publicItem, foregroundArtifact };
   }
   async handleControl(req, res) {
     const url = new URL(req.url, "http://local");

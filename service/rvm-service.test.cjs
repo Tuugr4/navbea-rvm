@@ -119,3 +119,41 @@ test("worker stdin closure rejects the frame without an uncaught write EOF", asy
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test("native foreground and alpha are separate one-use artifacts", async () => {
+  const secret = crypto.randomBytes(48).toString("base64url");
+  const service = new RvmService({ clientSecret: secret, capabilitySecret: secret, cameraClientToken: secret });
+  service.cameraRequest = async () => ({ data: Buffer.from("source-jpeg") });
+  const alpha = Buffer.from([0, 127, 255, 255]);
+  const foreground = Buffer.from([255, 216, 255, 217]);
+  const size = Buffer.alloc(4); size.writeUInt32BE(alpha.length);
+  service.worker = { pending: new Map(), process: async source => {
+    assert.equal(source.flags, 3);
+    return { width: 2, height: 2, codec: 5, payload: Buffer.concat([size, alpha, foreground]) };
+  } };
+  const result = await service.stillMatte({ id: "raw", rvmReadCapability: "read", width: 2, height: 2 });
+  assert.deepEqual(service.artifacts.get(result.id).payload, alpha);
+  assert.deepEqual(service.artifacts.get(result.foregroundArtifact.id).payload, foreground);
+  assert.notEqual(result.readCapability, result.foregroundArtifact.readCapability);
+  assert.equal(service.health().metrics.frames, 0, "native inference must not count as a live mask");
+  const response = { writeHead() {}, end(payload) { this.payload = payload; } };
+  const req = { method: "GET", url: `/v1/artifacts/${result.foregroundArtifact.id}`, headers: { "x-navbea-client-token": secret, authorization: `Bearer ${result.foregroundArtifact.readCapability}` } };
+  await service.handleControl(req, response);
+  assert.deepEqual(response.payload, foreground);
+  assert.equal(service.artifacts.has(result.foregroundArtifact.id), false);
+});
+
+test("slow CPU retains the newest waiting frame instead of an old inference queue", async () => {
+  const service = new RvmService();
+  service.cameraSocket = {};
+  const calls = [], completions = [];
+  service.worker = { process: frame => new Promise(resolve => { calls.push(frame.sequence); completions.push(() => { service.acceptMask({ ...frame, payload: Buffer.from([255]), width: 1, height: 1 }); resolve(); }); }) };
+  const first = service.processSourceFrame({ sequence: 1n });
+  await service.processSourceFrame({ sequence: 2n });
+  await service.processSourceFrame({ sequence: 3n });
+  assert.deepEqual(calls, [1n]);
+  completions[0](); await first;
+  assert.deepEqual(calls, [1n, 3n]);
+  assert.equal(service.metrics.dropped, 1);
+  service.stopping = true; completions[1]();
+});
