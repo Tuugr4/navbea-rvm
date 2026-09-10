@@ -19,9 +19,20 @@ MAGIC = b"NVF1"
 VERSION = 1
 HEADER = struct.Struct(">4sHHIQQIIIHH16sI")
 TYPE_FRAME = 1
+TYPE_RESET = 5  # Private supervisor/worker control; never published to clients.
 CODEC_MJPEG = 1
 CODEC_GRAY8 = 2
 MAX_PAYLOAD = 128 * 1024 * 1024
+_native_allocator_ready = False
+
+
+def register_native_allocator(ort):
+    global _native_allocator_ready
+    if not _native_allocator_ready:
+        info = ort.OrtMemoryInfo("Cpu", ort.OrtAllocatorType.ORT_ARENA_ALLOCATOR, 0, ort.OrtMemType.DEFAULT)
+        config = ort.OrtArenaCfg({"max_mem": 3 * 1024**3, "arena_extend_strategy": 1})
+        ort.create_and_register_allocator_v2("CPUExecutionProvider", info, {}, config)
+        _native_allocator_ready = True
 
 
 def select_onnx_providers(available: list[str], device_mode: str) -> list[str]:
@@ -75,13 +86,18 @@ def read_frame(stream):
     }
 
 
-def write_frame(stream, frame, payload: bytes, width: int, height: int, codec=CODEC_GRAY8):
+def write_frame(stream, frame, payload: bytes, width: int, height: int, codec=CODEC_GRAY8, message_type=TYPE_FRAME):
+    parts = payload if isinstance(payload, tuple) else (payload,)
+    length = sum(len(part) for part in parts)
+    if length > MAX_PAYLOAD:
+        raise ValueError("Worker output exceeds the protocol limit")
     header = HEADER.pack(
-        MAGIC, VERSION, TYPE_FRAME, 0, frame["sequence"], time.monotonic_ns(),
-        width, height, len(payload), codec, 0, frame["stream_id"], 0,
+        MAGIC, VERSION, message_type, 0, frame["sequence"], frame["timestamp"],
+        width, height, length, codec, 0, frame["stream_id"], 0,
     )
     stream.write(header)
-    stream.write(payload)
+    for part in parts:
+        stream.write(part)
     stream.flush()
 
 
@@ -132,7 +148,7 @@ class RvmEngine:
 
 
 class OnnxRvmEngine:
-    def __init__(self, model_path: Path, device_mode: str = "auto", downsample_ratio: float = 0.375, still_ratio: float = 0.5, threads: int = 0):
+    def __init__(self, model_path: Path, device_mode: str = "auto", downsample_ratio: float = 0.375, still_ratio: float = 0.5, threads: int = 0, still_max_edge: int = 0, still_threads: int = 0):
         import numpy as np
         import onnxruntime as ort
         from PIL import Image
@@ -149,13 +165,18 @@ class OnnxRvmEngine:
         self.session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         self.session_options.enable_mem_pattern = providers[0] != "DmlExecutionProvider"
         self.session_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+        self.session_options.add_session_config_entry("session.use_env_allocators", "0")
         self.run_options = ort.RunOptions()
         self.run_options.only_execute_path_to_fetches = True
         self.session = ort.InferenceSession(self.model_path, sess_options=self.session_options, providers=providers)
         self.primary_provider = providers[0]
         self.cpu_session = None
+        self.native_session = None
+        self.still_threads = still_threads or self.session_options.intra_op_num_threads
         self.downsample_ratio = np.asarray([downsample_ratio], dtype=np.float32)
         self.still_ratio = np.asarray([still_ratio], dtype=np.float32)
+        # Opt-in comparison profiles; zero preserves the approved fixed ratio.
+        self.still_max_edge = still_max_edge
         self.foreground_jpeg = None
         self.rec = [np.zeros((1, 1, 1, 1), dtype=np.float32) for _ in range(4)]
         self.rec_initialized = False
@@ -163,11 +184,42 @@ class OnnxRvmEngine:
     def reset(self):
         self.rec = [self.np.zeros((1, 1, 1, 1), dtype=self.np.float32) for _ in range(4)]
         self.rec_initialized = False
+        self.foreground_jpeg = None
+        if self.native_session is not None:
+            # Run a tiny empty-person probe after native outputs have been
+            # consumed. Shrink only the native arena, leaving live latency and
+            # loaded model weights intact between people.
+            trim = self.ort.RunOptions()
+            trim.only_execute_path_to_fetches = True
+            trim.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
+            self.native_session.run(["pha"], {
+                "src": self.np.zeros((1, 3, 128, 128), dtype=self.np.float32),
+                "r1i": self.rec[0], "r2i": self.rec[1], "r3i": self.rec[2], "r4i": self.rec[3],
+                "downsample_ratio": self.still_ratio,
+            }, trim)
 
     def _cpu(self):
         if self.cpu_session is None:
             self.cpu_session = self.ort.InferenceSession(self.model_path, sess_options=self.session_options, providers=["CPUExecutionProvider"])
         return self.cpu_session
+
+    def _native(self):
+        if self.primary_provider == "CUDAExecutionProvider":
+            return self.session
+        if self.native_session is None:
+            register_native_allocator(self.ort)
+            options = self.ort.SessionOptions()
+            options.intra_op_num_threads = self.still_threads
+            options.inter_op_num_threads = 1
+            options.execution_mode = self.ort.ExecutionMode.ORT_SEQUENTIAL
+            # Exact-growth, 3 GiB scratch budget; independent from the live
+            # allocator and reclaimed on the acknowledged person-state reset.
+            options.enable_cpu_mem_arena = True
+            options.enable_mem_pattern = False
+            options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            options.add_session_config_entry("session.use_env_allocators", "1")
+            self.native_session = self.ort.InferenceSession(self.model_path, sess_options=options, providers=["CPUExecutionProvider"])
+        return self.native_session
 
     def _run(self, session, src, rec, ratio=None):
         feeds = {
@@ -178,7 +230,17 @@ class OnnxRvmEngine:
             # Live subscribers consume alpha only. Do not fetch the full RGB
             # foreground output until a native still actually needs it.
             return [None, *session.run(["pha", "r1o", "r2o", "r3o", "r4o"], feeds, self.run_options)]
-        return session.run(None, feeds, self.run_options)
+        # Still recurrence is discarded. Fetch only the two native outputs.
+        return session.run(["fgr", "pha"], feeds, self.run_options)
+
+    def _bytes(self, values):
+        # ORT owns these independent output arrays. They are no longer consumed
+        # by inference; keep rounding/clipping identical while avoiding 3 large
+        # temporary float tensors. Never apply this to recurrent output arrays.
+        self.np.clip(values, 0, 1, out=values)
+        self.np.multiply(values, 255.0, out=values)
+        self.np.rint(values, out=values)
+        return values.astype(self.np.uint8)
 
     def process(self, payload: bytes, native: bool = False) -> tuple[bytes, int, int]:
         image = self.Image.open(io.BytesIO(payload)).convert("RGB")
@@ -186,17 +248,22 @@ class OnnxRvmEngine:
             scale = min(1280 / image.width, 720 / image.height)
             image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), self.Image.Resampling.BILINEAR)
         width, height = image.size
-        src = self.np.ascontiguousarray(self.np.asarray(image, dtype=self.np.float32).transpose(2, 0, 1)[None])
+        src = self.np.empty((1, 3, height, width), dtype=self.np.float32)
+        src[0] = self.np.asarray(image).transpose(2, 0, 1)
         src *= 1.0 / 255.0
+        image.close()
         self.foreground_jpeg = None
         if native:
             # Keep the fast DirectML live session intact. Native stills use a
             # fresh CPU recurrence so their different resolution cannot crash
             # the DirectML Expand nodes.
             native_rec = [self.np.zeros((1, 1, 1, 1), dtype=self.np.float32) for _ in range(4)]
-            session = self._cpu() if self.primary_provider == "DmlExecutionProvider" else self.session
-            outputs = self._run(session, src, native_rec, self.still_ratio)
-            foreground = (self.np.clip(outputs[0][0].transpose(1, 2, 0), 0, 1) * 255).round().astype(self.np.uint8)
+            session = self._native()
+            ratio = self.np.asarray([min(float(self.still_ratio[0]), self.still_max_edge / max(width, height))], dtype=self.np.float32) if self.still_max_edge else self.still_ratio
+            outputs = self._run(session, src, native_rec, ratio)
+            del src
+            foreground = self._bytes(outputs[0][0].transpose(1, 2, 0))
+            outputs[0] = None
             encoded = io.BytesIO()
             self.Image.fromarray(foreground).save(encoded, "JPEG", quality=97, subsampling=0)
             self.foreground_jpeg = encoded.getvalue()
@@ -221,8 +288,7 @@ class OnnxRvmEngine:
                 outputs = self._run(self.session, src, self.rec)
             self.rec = list(outputs[2:6])
             self.rec_initialized = True
-        alpha = self.np.clip(outputs[1][0, 0], 0, 1)
-        return (alpha * 255.0).round().astype(self.np.uint8).tobytes(), width, height
+        return self._bytes(outputs[1][0, 0]).tobytes(), width, height
 
 
 class FixtureEngine:
@@ -238,6 +304,13 @@ def serve(engine, input_stream=None, output_stream=None) -> int:
     while True:
         try: frame = read_frame(input_stream)
         except EOFError: return 0
+        if frame["type"] == TYPE_RESET:
+            if frame["payload"] or frame["codec"] != 4:
+                raise ValueError("Invalid reset request")
+            if hasattr(engine, "reset"):
+                engine.reset()
+            write_frame(output_stream, frame, b"", 0, 0, 4, TYPE_RESET)
+            continue
         if frame["type"] != TYPE_FRAME or frame["codec"] not in {CODEC_MJPEG, 3}: continue
         native_still = bool(frame["flags"] & 1)
         # Live-view recurrent tensors are sized for the preview frame. A native
@@ -255,9 +328,12 @@ def serve(engine, input_stream=None, output_stream=None) -> int:
         if native_still and frame["flags"] & 2 and foreground:
             # Private worker codec 5: uint32 mask length, GRAY8 mask, foreground JPEG.
             # Public stream subscribers continue to receive only GRAY8 frames.
-            write_frame(output_stream, frame, struct.pack(">I", len(mask)) + mask + foreground, width, height, 5)
+            write_frame(output_stream, frame, (struct.pack(">I", len(mask)), mask, foreground), width, height, 5)
         else:
             write_frame(output_stream, frame, mask, width, height)
+        if hasattr(engine, "foreground_jpeg"):
+            engine.foreground_jpeg = None
+        del mask, foreground, frame
 
 
 def self_test() -> int:
@@ -293,17 +369,19 @@ def main() -> int:
     parser.add_argument("--device", choices=("auto", "cuda", "directml", "cpu"), default=os.environ.get("RVM_DEVICE", "auto"))
     parser.add_argument("--downsample-ratio", type=float, default=0.375)
     parser.add_argument("--still-ratio", type=float, default=0.5)
+    parser.add_argument("--still-max-edge", type=int, choices=(0, 512, 768, 1024), default=0)
     parser.add_argument("--threads", type=int, default=0)
+    parser.add_argument("--still-threads", type=int, default=0)
     parser.add_argument("--fixture", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--startup-id", default="")
     parser.add_argument("--check-runtime", action="store_true")
     args = parser.parse_args()
-    if not 0 < args.downsample_ratio <= 1 or not 0 < args.still_ratio <= 1 or not 0 <= args.threads <= (os.cpu_count() or 1):
+    if not 0 < args.downsample_ratio <= 1 or not 0 < args.still_ratio <= 1 or not 0 <= args.threads <= (os.cpu_count() or 1) or not 0 <= args.still_threads <= (os.cpu_count() or 1):
         parser.error("Ratios must be in (0, 1]; threads must be 0 (automatic) or an available processor count")
     if args.self_test: return self_test()
     model_path = Path(args.model).resolve()
-    engine = FixtureEngine() if args.fixture else OnnxRvmEngine(model_path, args.device, args.downsample_ratio, args.still_ratio, args.threads) if model_path.suffix.lower() == ".onnx" else RvmEngine(model_path, args.device, args.downsample_ratio)
+    engine = FixtureEngine() if args.fixture else OnnxRvmEngine(model_path, args.device, args.downsample_ratio, args.still_ratio, args.threads, args.still_max_edge, args.still_threads) if model_path.suffix.lower() == ".onnx" else RvmEngine(model_path, args.device, args.downsample_ratio)
     if not args.fixture:
         from PIL import Image
         sample = io.BytesIO()

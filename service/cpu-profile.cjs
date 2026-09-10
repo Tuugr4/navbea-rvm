@@ -61,24 +61,26 @@ function benchmark(options, candidates) {
 }
 async function resolveCpuProfile(options, dataRoot) {
   const cpu = await topology();
-  if (options.threads !== "auto" && options.threads !== undefined) {
-    const threads = Number(options.threads);
-    if (!Number.isInteger(threads) || threads < 1 || threads > cpu.available) throw new Error(`RVM_CPU_THREADS must be auto or between 1 and ${cpu.available}`);
-    return { threads, mode: "manual", cpu };
-  }
+  const budget = options.cpuBudget === undefined || options.cpuBudget === "auto" ? Math.max(1, cpu.available - Math.ceil(cpu.available / 4)) : Number(options.cpuBudget);
+  if (!Number.isInteger(budget) || budget < 1 || budget > cpu.available) throw new Error(`RVM_CPU_BUDGET must be auto or between 1 and ${cpu.available}`);
   const modelHash = crypto.createHash("sha256").update(await fs.readFile(options.model)).digest("hex");
   const engineHash = crypto.createHash("sha256").update(await fs.readFile(options.script)).digest("hex");
+  if (options.threads !== "auto" && options.threads !== undefined) {
+    const threads = Number(options.threads);
+    if (!Number.isInteger(threads) || threads < 1 || threads > budget) throw new Error(`RVM_CPU_THREADS must fit the configured CPU budget (${budget})`);
+    return { threads, mode: "manual", cpu, budget, modelHash, engineHash };
+  }
   const benchmarkHash = crypto.createHash("sha256").update(await fs.readFile(path.join(path.dirname(options.script), "cpu_benchmark.py"))).digest("hex");
   const runtime = await exec(options.python, ["-B", "-c", "import onnxruntime; print(onnxruntime.__version__)"], { windowsHide: true, timeout: 15_000 });
-  const key = crypto.createHash("sha256").update(JSON.stringify({ schema: 1, cpu, modelHash, engineHash, benchmarkHash, ort: runtime.stdout.trim(), ratio: options.liveRatio })).digest("hex");
+  const key = crypto.createHash("sha256").update(JSON.stringify({ schema: 2, cpu, budget, modelHash, engineHash, benchmarkHash, ort: runtime.stdout.trim(), ratio: options.liveRatio })).digest("hex");
   const file = path.join(dataRoot, "cpu-profile.json");
   try {
     const saved = JSON.parse(await fs.readFile(file, "utf8"));
-    if (saved.key === key && saved.threads >= 1 && saved.threads <= cpu.available && Number.isInteger(saved.threads)) return { ...saved, cached: true };
+    if (saved.key === key && saved.threads >= 1 && saved.threads <= budget && Number.isInteger(saved.threads)) return { ...saved, cached: true };
   } catch { /* First run, changed hardware/model, or invalid cache: measure again. */ }
-  const results = await benchmark(options, threadCandidates(cpu.physical, cpu.available));
+  const results = await benchmark(options, threadCandidates(cpu.physical, budget));
   const selected = chooseProfile(results);
-  const profile = { key, threads: selected.threads, mode: "auto", cpu, results, measuredAt: new Date().toISOString() };
+  const profile = { key, threads: selected.threads, mode: "auto", cpu, budget, modelHash, engineHash, results, measuredAt: new Date().toISOString() };
   await fs.mkdir(dataRoot, { recursive: true });
   const temporary = `${file}.${crypto.randomUUID()}.tmp`;
   await fs.writeFile(temporary, JSON.stringify(profile, null, 2), { mode: 0o600 });

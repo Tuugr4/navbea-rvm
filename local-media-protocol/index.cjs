@@ -71,18 +71,55 @@ function encodeFrame(frame) {
 }
 
 class FrameDecoder {
-  constructor(options = {}) { this.maxPayloadBytes = options.maxPayloadBytes || MAX_PAYLOAD_BYTES; this.buffer = Buffer.alloc(0); }
+  constructor(options = {}) {
+    this.maxPayloadBytes = options.maxPayloadBytes ?? MAX_PAYLOAD_BYTES;
+    if (!Number.isSafeInteger(this.maxPayloadBytes) || this.maxPayloadBytes < 0 || this.maxPayloadBytes > MAX_PAYLOAD_BYTES) {
+      throw new Error("Invalid decoder payload limit");
+    }
+    this.headerBytes = Buffer.allocUnsafe(HEADER_BYTES);
+    this.headerOffset = 0;
+    this.header = null;
+    this.payload = null;
+    this.payloadOffset = 0;
+    this.error = null;
+  }
+
   push(chunk) {
+    if (this.error) throw this.error;
     if (!Buffer.isBuffer(chunk)) chunk = Buffer.from(chunk);
-    this.buffer = this.buffer.length ? Buffer.concat([this.buffer, chunk]) : chunk;
     const frames = [];
-    while (this.buffer.length >= HEADER_BYTES) {
-      const header = decodeHeader(this.buffer.subarray(0, HEADER_BYTES));
-      if (header.payloadLength > this.maxPayloadBytes) throw new Error("Frame payload exceeds decoder limit");
-      const total = HEADER_BYTES + header.payloadLength;
-      if (this.buffer.length < total) break;
-      frames.push({ ...header, payload: this.buffer.subarray(HEADER_BYTES, total) });
-      this.buffer = this.buffer.subarray(total);
+    let offset = 0;
+    try {
+      while (offset < chunk.length) {
+        if (!this.header) {
+          const count = Math.min(HEADER_BYTES - this.headerOffset, chunk.length - offset);
+          chunk.copy(this.headerBytes, this.headerOffset, offset, offset + count);
+          this.headerOffset += count;
+          offset += count;
+          if (this.headerOffset < HEADER_BYTES) break;
+          this.header = decodeHeader(this.headerBytes);
+          if (this.header.payloadLength > this.maxPayloadBytes) throw new Error("Frame payload exceeds decoder limit");
+          // One bounded allocation after validation; fragmented native masks are
+          // copied once instead of repeatedly copying the accumulated payload.
+          this.payload = Buffer.allocUnsafe(this.header.payloadLength);
+        }
+        const count = Math.min(this.header.payloadLength - this.payloadOffset, chunk.length - offset);
+        chunk.copy(this.payload, this.payloadOffset, offset, offset + count);
+        this.payloadOffset += count;
+        offset += count;
+        if (this.payloadOffset < this.header.payloadLength) break;
+        frames.push({ ...this.header, payload: this.payload });
+        // Emitted buffers remain owned by the caller and are never reused.
+        this.header = null;
+        this.headerOffset = 0;
+        this.payload = null;
+        this.payloadOffset = 0;
+      }
+    } catch (error) {
+      this.error = error;
+      this.header = null;
+      this.payload = null;
+      throw error;
     }
     return frames;
   }
