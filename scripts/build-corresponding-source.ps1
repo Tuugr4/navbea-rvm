@@ -3,7 +3,8 @@ param(
   [string]$Tag = "v1.0.4",
   [Parameter(Mandatory=$true)][string]$UpstreamSourceZip,
   [Parameter(Mandatory=$true)][string]$UpstreamCheckpoint,
-  [Parameter(Mandatory=$true)][string]$Output
+  [Parameter(Mandatory=$true)][string]$Output,
+  [switch]$WorkingTree
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,10 +16,13 @@ $package = Get-Content (Join-Path $projectRoot "package.json") -Raw | ConvertFro
 if($package.version -ne $Version){ throw "package.json version $($package.version) does not match $Version" }
 
 $dirty = (& git -C $projectRoot status --porcelain --untracked-files=all) -join "`n"
-if($dirty){ throw "Corresponding source must be built from a clean tagged worktree." }
+if($dirty -and -not $WorkingTree){ throw "Corresponding source must be built from a clean tagged worktree." }
+if($WorkingTree -and $Version -notmatch '-local$'){throw 'Working-tree source must have an explicit -local version'}
 $head = (& git -C $projectRoot rev-parse HEAD).Trim()
-$tagCommit = (& git -C $projectRoot rev-list -n 1 $Tag).Trim()
-if(-not $tagCommit -or $head -ne $tagCommit){ throw "$Tag must point to the checked-out commit." }
+if(-not $WorkingTree){
+  $tagCommit = (& git -C $projectRoot rev-list -n 1 $Tag).Trim()
+  if(-not $tagCommit -or $head -ne $tagCommit){ throw "$Tag must point to the checked-out commit." }
+}
 
 $expectedSource = "b58b1187fb9373f56db2e463a7629cf9f539c4c97ea361c793620396211122da"
 $expectedCheckpoint = "3c7c1d92033f7c38d6577c481d13a195d7d80a159b960f4f3119ac7b534cf4f8"
@@ -32,17 +36,34 @@ $treeZip = Join-Path $scratch "tree.zip"
 $stage = Join-Path $scratch "stage"
 try {
   New-Item -ItemType Directory -Path $scratch,$stage -Force | Out-Null
-  & git -C $projectRoot archive --format=zip --prefix="navbea-rvm-$Version/" --output=$treeZip $Tag
-  if($LASTEXITCODE -ne 0){ throw "git archive failed" }
-  Expand-Archive -LiteralPath $treeZip -DestinationPath $stage -Force
   $treeRoot = Join-Path $stage "navbea-rvm-$Version"
+  $fileHashes=[ordered]@{}
+  if($WorkingTree){
+    $files=@(& git -C $projectRoot ls-files --cached --others --exclude-standard | Sort-Object -Unique)
+    if($LASTEXITCODE -ne 0){throw 'Cannot enumerate corresponding source'}
+    foreach($relative in $files){
+      if($relative -eq 'scripts/cpu-preview.cjs'){continue}
+      $file=Join-Path $projectRoot $relative
+      if(-not(Test-Path -LiteralPath $file -PathType Leaf)){continue}
+      $target=Join-Path $treeRoot $relative
+      New-Item -ItemType Directory -Path (Split-Path $target) -Force|Out-Null
+      Copy-Item -LiteralPath $file -Destination $target
+      $fileHashes[$relative]=(Get-FileHash -LiteralPath $file).Hash.ToLower()
+    }
+  }else{
+    & git -C $projectRoot archive --format=zip --prefix="navbea-rvm-$Version/" --output=$treeZip $Tag
+    if($LASTEXITCODE -ne 0){ throw "git archive failed" }
+    Expand-Archive -LiteralPath $treeZip -DestinationPath $stage -Force
+  }
   $upstream = Join-Path $treeRoot "upstream"
   New-Item -ItemType Directory -Path $upstream -Force | Out-Null
   Copy-Item -LiteralPath $sourceZip -Destination (Join-Path $upstream "RobustVideoMatting-v1.0.0-source.zip")
   Copy-Item -LiteralPath $checkpoint -Destination (Join-Path $upstream "rvm_mobilenetv3.pth")
   $manifest = [ordered]@{
     version = $Version
-    tag = $Tag
+    tag = if($WorkingTree){$null}else{$Tag}
+    kind = if($WorkingTree){'local-working-tree'}else{'tagged-release'}
+    files = $fileHashes
     commit = $head
     license = "GPL-3.0-only"
     upstream = [ordered]@{
@@ -55,10 +76,12 @@ try {
   }
   [IO.File]::WriteAllText((Join-Path $treeRoot "CORRESPONDING_SOURCE_MANIFEST.json"),($manifest | ConvertTo-Json -Depth 5),(New-Object Text.UTF8Encoding($false)))
   New-Item -ItemType Directory -Path (Split-Path $outputPath) -Force | Out-Null
-  if(Test-Path -LiteralPath $outputPath){ Remove-Item -LiteralPath $outputPath -Force }
+  if(Test-Path -LiteralPath $outputPath){throw 'Source output exists; choose a new immutable output'}
   Compress-Archive -Path (Join-Path $stage "*") -DestinationPath $outputPath -CompressionLevel Optimal
   $hash = (Get-FileHash -LiteralPath $outputPath -Algorithm SHA256).Hash.ToLower()
   Write-Output "source=$outputPath commit=$head sha256=$hash"
 } finally {
-  if(Test-Path -LiteralPath $scratch){ Remove-Item -LiteralPath $scratch -Recurse -Force -ErrorAction SilentlyContinue }
+  $resolved=[IO.Path]::GetFullPath($scratch)
+  if([IO.Path]::GetDirectoryName($resolved) -ne [IO.Path]::GetFullPath($env:TEMP).TrimEnd('\') -or [IO.Path]::GetFileName($resolved) -notmatch '^NavbeaRVMSource-[a-f0-9]{32}$'){throw 'Unsafe source cleanup path'}
+  if(Test-Path -LiteralPath $resolved){ Remove-Item -LiteralPath $resolved -Recurse -Force -ErrorAction SilentlyContinue }
 }

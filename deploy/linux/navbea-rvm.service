@@ -1,15 +1,21 @@
 [Unit]
 Description=Navbea RVM Service
-After=local-fs.target
+After=local-fs.target navbea-camera.service
+Wants=navbea-camera.service
 
 [Service]
 Type=simple
 User=navbea-rvm
 Group=navbea-media
-RuntimeDirectory=navbea
-RuntimeDirectoryMode=0750
+ExecStartPre=+/usr/bin/install -d -o root -g navbea-media -m 2775 /run/navbea
 StateDirectory=navbea/rvm
-ExecStart=/opt/navbea/rvm/node /opt/navbea/rvm/service/main.cjs
+StateDirectoryMode=0755
+Environment=ELECTRON_RUN_AS_NODE=1
+Environment=NAVBEA_RUNTIME_DIR=/run/navbea
+Environment=NAVBEA_RVM_DATA_DIR=/var/lib/navbea/rvm
+Environment=NAVBEA_CAMERA_DATA_DIR=/var/lib/navbea/camera
+Environment=RVM_DEVICE=cpu
+ExecStart=/usr/lib/navbea-rvm/navbea-rvm /usr/lib/navbea-rvm/resources/service/main.cjs
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true

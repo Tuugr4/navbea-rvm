@@ -1,0 +1,3 @@
+#!/bin/sh
+set -eu
+if [ "${1:-}" = remove ] || [ "${1:-}" = deconfigure ]; then systemctl disable --now navbea-rvm.service; fi

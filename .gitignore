@@ -1,4 +1,18 @@
 node_modules/
+
+# Local-only automated tests and test tooling
+test/
+tests/
+__tests__/
+*.test.*
+*.spec.*
+test_*.py
+vitest.config.*
+playwright.config.*
+scripts/test-*
+scripts/*smoke*
+scripts/*selftest*
+scripts/verify-runtime.cjs
 dist/
 out/
 out-*/

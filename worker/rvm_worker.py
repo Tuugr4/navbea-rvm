@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import struct
 import sys
@@ -295,12 +296,25 @@ def main() -> int:
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--fixture", action="store_true")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--startup-id", default="")
+    parser.add_argument("--check-runtime", action="store_true")
     args = parser.parse_args()
     if not 0 < args.downsample_ratio <= 1 or not 0 < args.still_ratio <= 1 or not 0 <= args.threads <= (os.cpu_count() or 1):
         parser.error("Ratios must be in (0, 1]; threads must be 0 (automatic) or an available processor count")
     if args.self_test: return self_test()
     model_path = Path(args.model).resolve()
     engine = FixtureEngine() if args.fixture else OnnxRvmEngine(model_path, args.device, args.downsample_ratio, args.still_ratio, args.threads) if model_path.suffix.lower() == ".onnx" else RvmEngine(model_path, args.device, args.downsample_ratio)
+    if not args.fixture:
+        from PIL import Image
+        sample = io.BytesIO()
+        Image.new("RGB", (128, 128), (80, 100, 120)).save(sample, format="JPEG")
+        mask, width, height = engine.process(sample.getvalue())
+        if width != 128 or height != 128 or len(mask) != width * height:
+            raise RuntimeError("RVM startup inference returned invalid dimensions")
+        engine.reset()
+    print(json.dumps({"event": "rvm-ready", "protocol": 1, "startupId": args.startup_id,
+                      "inferenceVerified": not args.fixture, "provider": getattr(engine, "primary_provider", args.device)}), file=sys.stderr, flush=True)
+    if args.check_runtime: return 0
     return serve(engine)
 
 

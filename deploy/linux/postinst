@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+[ "${1:-}" = configure ] || exit 0
+. /etc/os-release
+[ "$ID" = ubuntu ] && [ "$VERSION_ID" = 24.04 ] && [ "$(dpkg --print-architecture)" = amd64 ] || { echo 'Ubuntu 24.04 amd64 is required' >&2; exit 1; }
+getent group navbea-media >/dev/null || groupadd --system navbea-media
+id navbea-rvm >/dev/null 2>&1 || useradd --system --gid navbea-media --home-dir /var/lib/navbea/rvm --no-create-home --shell /usr/sbin/nologin navbea-rvm
+usermod -g navbea-media navbea-rvm
+install -d -o navbea-rvm -g navbea-media -m 0755 /var/lib/navbea/rvm
+install -d -o root -g navbea-media -m 0755 /run/navbea
+resources=/usr/lib/navbea-rvm/resources
+runuser -u navbea-rvm -- "$resources/runtime/bin/python" -I -B "$resources/worker/rvm_worker.py" --model "$resources/models/rvm_mobilenetv3_fp32.onnx" --device cpu --threads 1 --check-runtime
+install -m 0644 "$resources/deploy/linux/navbea-rvm.service" /lib/systemd/system/navbea-rvm.service
+systemctl daemon-reload
+systemctl enable navbea-rvm.service
+systemctl restart navbea-rvm.service

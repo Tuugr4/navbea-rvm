@@ -59,7 +59,9 @@ class PythonWorker {
     this.pending.clear();
   }
   start() {
+    const startupId = crypto.randomUUID();
     const args = [this.options.script, "--model", this.options.model, "--device", this.options.device || "auto"];
+    args.push("--startup-id", startupId);
     args.push("--downsample-ratio", String(this.options.liveRatio ?? 0.375), "--still-ratio", String(this.options.stillRatio ?? 0.5), "--threads", String(this.options.threads ?? 0));
     this.child = spawn(this.options.python, args, { windowsHide: true, shell: false, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PYTHONUNBUFFERED: "1" } });
     this.child.stdout.on("data", chunk => {
@@ -72,7 +74,24 @@ class PythonWorker {
     this.child.stderr.on("error", error => { this.onFailure?.(error); });
     return new Promise((resolve, reject) => {
       let settled = false;
-      const timer = setTimeout(() => { settled = true; resolve(); }, 300);
+      let diagnostic = "";
+      const timer = setTimeout(() => { settled = true; reject(new Error("RVM model readiness timed out")); this.child?.kill(); }, this.options.startupTimeoutMs || 120_000);
+      this.child.stderr.setEncoding("utf8");
+      this.child.stderr.on("data", chunk => {
+        if (settled) return;
+        diagnostic += chunk;
+        if (diagnostic.length > 64 * 1024) { diagnostic = ""; return; }
+        let newline;
+        while ((newline = diagnostic.indexOf("\n")) >= 0) {
+          const line = diagnostic.slice(0, newline); diagnostic = diagnostic.slice(newline + 1);
+          try {
+            const event = JSON.parse(line);
+            if (event.event === "rvm-ready" && event.protocol === 1 && event.startupId === startupId && event.inferenceVerified === true) {
+              settled = true; clearTimeout(timer); resolve();
+            }
+          } catch { /* Non-protocol Python diagnostics are logged separately. */ }
+        }
+      });
       this.child.once("error", error => { clearTimeout(timer); this.failPending(error); this.onFailure?.(error); if (!settled) { settled = true; reject(error); } });
       this.child.once("exit", code => {
         clearTimeout(timer);
@@ -114,13 +133,19 @@ class RvmService {
     this.status = "starting"; this.errorCode = null; this.error = null; this.sourceSession = null;
     this.metrics = { frames: 0, dropped: 0, inferenceMs: null, maskFps: 0, device: this.env.RVM_DEVICE || "auto" }; this.stopping = false; this.workerRestartTimer = null; this.stillCaptureBusy = false;
     this.sequenceTimes = new Map(); this.latestSourceFrame = null;
+    this.workerRestarts = 0; this.ownedEndpoints = new Set();
   }
   async ensureStorage() {
-    await fsp.mkdir(this.dataRoot, { recursive: true, mode: 0o700 });
-    const load = async (target, value) => { if (value) return value; try { const existing = (await fsp.readFile(target, "utf8")).trim(); if (existing.length >= 32) return existing; } catch {} const created = crypto.randomBytes(48).toString("base64url"); await fsp.writeFile(target, `${created}\n`, { mode: 0o600 }); return created; };
+    await fsp.mkdir(this.dataRoot, { recursive: true, mode: 0o755 });
+    const load = async (target, value) => { if (value) return value; const mode = this.platform !== "win32" && path.basename(target) === "client-token.txt" ? 0o644 : 0o600; try { const existing = (await fsp.readFile(target, "utf8")).trim(); if (existing.length < 32) throw new Error("Invalid local service credential"); if (this.platform !== "win32") await fsp.chmod(target, mode); return existing; } catch (error) { if (error.code !== "ENOENT") throw error; } const created = crypto.randomBytes(48).toString("base64url"); await fsp.writeFile(target, `${created}\n`, { mode, flag: "wx" }); return created; };
     this.clientSecret = await load(path.join(this.dataRoot, "client-token.txt"), this.clientSecret);
     this.capabilitySecret = await load(path.join(this.dataRoot, "capability-secret.txt"), this.capabilitySecret);
-    if (!this.cameraClientToken) this.cameraClientToken = (await fsp.readFile(path.join(this.cameraDataRoot, "client-token.txt"), "utf8")).trim();
+    const deadline = Date.now() + Number(this.env.NAVBEA_CAMERA_STARTUP_WAIT_MS || 30_000);
+    while (!this.cameraClientToken) {
+      try { this.cameraClientToken = (await fsp.readFile(path.join(this.cameraDataRoot, "client-token.txt"), "utf8")).trim(); }
+      catch (error) { if (error.code !== "ENOENT" || Date.now() >= deadline || this.stopping) throw error; await new Promise(resolve => setTimeout(resolve, 250)); }
+      if (this.cameraClientToken && this.cameraClientToken.length < 32) throw new Error("Invalid Camera client credential");
+    }
   }
   workerOptions() {
     const packagedRoot = this.env.NAVBEA_RVM_ROOT || path.resolve(__dirname, "..");
@@ -142,7 +167,16 @@ class RvmService {
     this.metrics.threads = profile.threads; this.metrics.threadMode = profile.mode;
     this.metrics.availableProcessors = profile.cpu.available; this.metrics.physicalCores = profile.cpu.physical;
     this.metrics.device = options.device;
-    this.worker = new PythonWorker(options); this.worker.onMask = frame => this.acceptMask(frame); this.worker.onFailure = error => { this.status = "unavailable"; this.errorCode = "RVM_WORKER_PIPE_FAILED"; this.error = error.message; }; this.worker.onExit = code => { this.status = "unavailable"; this.errorCode = "RVM_WORKER_EXITED"; this.error = `RVM worker exited (${code})`; this.worker = null; if (!this.stopping) this.workerRestartTimer = setTimeout(() => this.startWorker().catch(error => { this.error = error.message; }), 1000); }; await this.worker.start(); if (this.stopping) { this.worker?.stop(); this.worker = null; return; } this.status = "ready"; this.errorCode = null; this.error = null;
+    this.worker = new PythonWorker(options);
+    const worker = this.worker;
+    worker.onMask = frame => this.acceptMask(frame);
+    worker.onFailure = error => { this.status = "unavailable"; this.errorCode = "RVM_WORKER_PIPE_FAILED"; this.error = error.message; };
+    const startedAt = Date.now();
+    worker.onExit = code => { if (this.worker !== worker) return; if (Date.now() - startedAt > 120_000) this.workerRestarts = 0; this.worker = null; this.scheduleWorkerRestart(new Error(`RVM worker exited (${code})`)); };
+    try { await worker.start(); }
+    catch (error) { worker.stop(); if (this.worker === worker) this.worker = null; throw error; }
+    if (this.stopping) { worker.stop(); this.worker = null; return; }
+    this.status = "ready"; this.errorCode = null; this.error = null;
   }
   cameraRequest(method, pathname, body, authorization) {
     const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
@@ -269,9 +303,40 @@ class RvmService {
     socket.on("data", chunk => { if (subscriber.authorized) return; handshake = Buffer.concat([handshake, chunk]); if (handshake.length > 8192) return socket.destroy(); const end = handshake.indexOf(10); if (end < 0) return; try { const message = JSON.parse(handshake.subarray(0, end).toString()); const claims = verifyCapability(message.capability, this.capabilitySecret, { audience: "rvm", scope: "stream:read", session: message.sessionId }); const item = this.sessions.get(message.sessionId); if (!item || item.maskStreamId !== claims.streamId) throw new Error("Unknown RVM session"); subscriber.authorized = true; subscriber.streamId = item.maskStreamId; this.subscribers.add(subscriber); socket.write('{"status":"ready"}\n'); } catch { socket.destroy(); } });
     socket.on("close", () => { subscriber.closed = true; this.subscribers.delete(subscriber); }); socket.on("error", () => { subscriber.closed = true; this.subscribers.delete(subscriber); });
   }
-  async listen(server, socketPath) { if (this.platform !== "win32") { await fsp.mkdir(path.dirname(socketPath), { recursive: true, mode: 0o750 }); try { await fsp.unlink(socketPath); } catch {} } const evaluationSharedPipe = this.env.NAVBEA_PIPE_READABLE_ALL === "1"; const listenTarget = this.platform === "win32" ? { path: socketPath, readableAll: evaluationSharedPipe, writableAll: evaluationSharedPipe } : socketPath; await new Promise((resolve, reject) => { server.once("error", reject); server.listen(listenTarget, resolve); }); if (this.platform !== "win32") await fsp.chmod(socketPath, 0o660); }
-  async start() { await this.ensureStorage(); try { await this.startWorker(); } catch (error) { this.status = "unavailable"; this.errorCode = "RVM_RUNTIME_UNAVAILABLE"; this.error = error.message; } this.controlServer = http.createServer((req, res) => void this.handleControl(req, res)); this.streamServer = net.createServer(socket => this.handleStream(socket)); await this.listen(this.controlServer, this.paths.control); await this.listen(this.streamServer, this.paths.stream); return this; }
-  async stop() { this.stopping = true; if (this.workerRestartTimer) clearTimeout(this.workerRestartTimer); this.cameraSocket?.destroy(); this.worker?.stop(); for (const item of this.subscribers) item.socket.destroy(); await Promise.all([this.controlServer, this.streamServer].filter(Boolean).map(server => new Promise(resolve => server.close(resolve)))); if (this.platform !== "win32") for (const value of Object.values(this.paths)) try { await fsp.unlink(value); } catch {} }
+  async listen(server, socketPath) {
+    if (this.platform !== "win32") {
+      await fsp.mkdir(path.dirname(socketPath), { recursive: true, mode: 0o755 });
+      const alive = await new Promise(resolve => { const socket = net.createConnection(socketPath); socket.setTimeout(1000, () => { socket.destroy(); resolve(true); }); socket.once("connect", () => { socket.destroy(); resolve(true); }); socket.once("error", error => resolve(!["ENOENT","ECONNREFUSED"].includes(error.code))); });
+      if (alive) throw new Error("RVM endpoint is already active");
+      await fsp.unlink(socketPath).catch(error => { if (error.code !== "ENOENT") throw error; });
+    }
+    const shared = this.env.NAVBEA_PIPE_READABLE_ALL === "1";
+    await new Promise((resolve, reject) => { server.once("error", reject); server.listen(this.platform === "win32" ? { path: socketPath, readableAll: shared, writableAll: shared } : socketPath, resolve); });
+    this.ownedEndpoints.add(socketPath);
+    if (this.platform !== "win32") await fsp.chmod(socketPath, 0o666);
+  }
+  scheduleWorkerRestart(error) {
+    this.status = "unavailable"; this.errorCode = "RVM_RUNTIME_UNAVAILABLE"; this.error = error.message;
+    if (this.stopping || this.workerRestartTimer || this.workerRestarts >= 5) return;
+    const delay = Math.min(30_000, 1000 * 2 ** this.workerRestarts++);
+    this.workerRestartTimer = setTimeout(() => { this.workerRestartTimer = null; void this.startWorker().catch(error => this.scheduleWorkerRestart(error)); }, delay);
+  }
+  async start() {
+    try {
+      await this.ensureStorage();
+      this.controlServer = http.createServer((req, res) => void this.handleControl(req, res)); this.streamServer = net.createServer(socket => this.handleStream(socket));
+      await this.listen(this.controlServer, this.paths.control); await this.listen(this.streamServer, this.paths.stream);
+      await this.startWorker().catch(error => this.scheduleWorkerRestart(error));
+      return this;
+    } catch (error) { await this.stop(); throw error; }
+  }
+  async stop() {
+    this.stopping = true; if (this.workerRestartTimer) clearTimeout(this.workerRestartTimer);
+    this.cameraSocket?.destroy(); this.worker?.stop();
+    for (const item of this.subscribers) item.socket.destroy();
+    await Promise.all([this.controlServer, this.streamServer].filter(server => server?.listening).map(server => new Promise(resolve => server.close(resolve))));
+    if (this.platform !== "win32") for (const value of this.ownedEndpoints) await fsp.unlink(value).catch(() => {});
+  }
 }
 
 module.exports = { RvmService, PythonWorker, defaultDataRoot, VERSION, API_VERSION, writeLatestBounded };

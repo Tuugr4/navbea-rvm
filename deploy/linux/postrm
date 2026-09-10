@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+if [ "${1:-}" = remove ] || [ "${1:-}" = purge ]; then
+  rm -f /lib/systemd/system/navbea-rvm.service
+  systemctl daemon-reload
+fi

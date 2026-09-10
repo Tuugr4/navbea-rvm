@@ -18,7 +18,10 @@ const required = [
 ];
 for (const item of required) await stat(path.join(root, item));
 const offer = await readFile(path.join(root, "SOURCE_OFFER.md"), "utf8");
-if (!offer.includes(`Navbea RVM ${packageJson.version}`) || !offer.includes(`/releases/tag/v${packageJson.version}`)) throw new Error("Source offer does not match the package version");
+const local = packageJson.version.endsWith("-local");
+const localReceipt = local ? JSON.parse(await readFile(path.join(root,"RVM_RELEASE_MANIFEST.json"),"utf8")) : null;
+if (!offer.includes(`Navbea RVM ${packageJson.version}`) || (!local && !offer.includes(`/releases/tag/v${packageJson.version}`))) throw new Error("Source offer does not match the package version");
+if (local && (localReceipt.kind !== "local-working-tree" || localReceipt.version !== packageJson.version || localReceipt.sourceOffer !== `source/navbea-rvm-${packageJson.version}-corresponding-source.zip`)) throw new Error("Local corresponding-source receipt is missing or inconsistent");
 const notices = await readFile(path.join(root, "THIRD_PARTY_NOTICES.md"), "utf8");
 for (const name of ["Robust Video Matting", "ReactDOM", "Scheduler", "Phosphor", "Electron", "ONNX Runtime", "NumPy", "Pillow"]) if (!notices.includes(name)) throw new Error(`Third-party notice is missing ${name}`);
 const sbom = JSON.parse(await readFile(path.join(root, "SBOM.spdx.json"), "utf8"));
@@ -32,4 +35,5 @@ const sourceArchive = path.join(root, "source", `navbea-rvm-${packageJson.versio
 const sourceInfo = await stat(sourceArchive);
 if (sourceInfo.size < 15_000_000) throw new Error("Corresponding-source archive is missing upstream source/checkpoint material");
 const sourceHash = createHash("sha256").update(await readFile(sourceArchive)).digest("hex");
-console.log(JSON.stringify({ status: "release-ready", version: packageJson.version, model: manifest.model, modelSha256: modelHash, sourceSha256: sourceHash, license: manifest.license }, null, 2));
+if (local && (localReceipt.sourceSha256 !== sourceHash || localReceipt.modelSha256 !== modelHash)) throw new Error("Local source/model hash mismatch");
+console.log(JSON.stringify({ status: local ? "local-source-verified" : "release-ready", version: packageJson.version, model: manifest.model, modelSha256: modelHash, sourceSha256: sourceHash, license: manifest.license }, null, 2));
