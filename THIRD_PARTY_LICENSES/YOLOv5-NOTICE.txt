@@ -1,0 +1,10 @@
+YOLOv5 v7.0 person instance segmentation, Copyright Ultralytics.
+Source: https://github.com/ultralytics/yolov5
+Revision: 915bbf294bb74c859f0b41f1c23bc395014ea679 (v7.0)
+License: GNU General Public License version 3. See YOLOv5-GPL-3.0.txt.
+
+The original yolov5n-seg.pt checkpoint is exported to dynamic FP32 ONNX,
+opset 12. Source, checkpoint, export script and pinned hashes are included
+with the corresponding-source distribution. No current Ultralytics Python
+package is used or shipped. Selection and masking are implemented locally
+in worker/subjects.py. No biometric identity is stored.

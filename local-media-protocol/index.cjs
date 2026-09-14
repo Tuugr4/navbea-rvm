@@ -5,7 +5,7 @@ const MAGIC = Buffer.from("NVF1");
 const PROTOCOL_VERSION = 1;
 const HEADER_BYTES = 64;
 const MAX_PAYLOAD_BYTES = 128 * 1024 * 1024;
-const MessageType = Object.freeze({ FRAME: 1, DROPPED: 2, END: 3, ERROR: 4 });
+const MessageType = Object.freeze({ FRAME: 1, DROPPED: 2, END: 3, ERROR: 4, SUBJECT_STATE: 6 });
 const Codec = Object.freeze({ MJPEG: 1, GRAY8: 2, JPEG: 3, JSON: 4 });
 
 function endpointPaths(service, platform = process.platform, env = process.env) {
@@ -151,6 +151,7 @@ function verifyCapability(token, secret, expected = {}) {
 }
 
 module.exports = {
+  ...require("./subjects.cjs"),
   MAGIC, PROTOCOL_VERSION, HEADER_BYTES, MAX_PAYLOAD_BYTES, MessageType, Codec,
   endpointPaths, encodeHeader, decodeHeader, encodeFrame, FrameDecoder,
   signCapability, verifyCapability,

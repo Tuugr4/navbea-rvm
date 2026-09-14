@@ -6,6 +6,7 @@
   "documentNamespace": "https://github.com/Tuugr4/navbea-rvm/sbom/1.0.4",
   "creationInfo": {"created":"2026-09-03T00:00:00Z","creators":["Organization: Navbea"]},
   "packages": [
+    {"name":"YOLOv5n segmentation ONNX","SPDXID":"SPDXRef-Package-SubjectModel","versionInfo":"7.0","downloadLocation":"https://github.com/ultralytics/yolov5/releases/tag/v7.0","filesAnalyzed":false,"licenseConcluded":"GPL-3.0-only","licenseDeclared":"GPL-3.0-only","copyrightText":"Copyright Ultralytics","checksums":[{"algorithm":"SHA256","checksumValue":"6ce62b250fbeca74ad493697b015fef043a6b3248a4d7f301320c4066de13d0d"}]},
     {"name":"Navbea RVM","SPDXID":"SPDXRef-Package-NavbeaRVM","versionInfo":"1.0.4","downloadLocation":"https://github.com/Tuugr4/navbea-rvm","filesAnalyzed":false,"licenseConcluded":"GPL-3.0-only","licenseDeclared":"GPL-3.0-only","copyrightText":"NOASSERTION"},
     {"name":"Robust Video Matting MobileNetV3 ONNX","SPDXID":"SPDXRef-Package-RVMModel","versionInfo":"1.0.0","downloadLocation":"https://github.com/PeterL1n/RobustVideoMatting/releases/tag/v1.0.0","filesAnalyzed":false,"licenseConcluded":"GPL-3.0-only","licenseDeclared":"GPL-3.0-only","copyrightText":"Copyright Shanchuan Lin, Linjie Yang, Imran Saleemi and Soumyadip Sengupta","checksums":[{"algorithm":"SHA256","checksumValue":"88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828"}]},
     {"name":"@navbea/local-media-protocol","SPDXID":"SPDXRef-Package-LocalMediaProtocol","versionInfo":"1.0.0","downloadLocation":"NOASSERTION","filesAnalyzed":false,"licenseConcluded":"MIT","licenseDeclared":"MIT","copyrightText":"Copyright 2026 Navbea"},
@@ -26,6 +27,7 @@
     {"name":"pip","SPDXID":"SPDXRef-Package-pip","versionInfo":"25.0.1","downloadLocation":"https://pypi.org/project/pip/25.0.1/","filesAnalyzed":false,"licenseConcluded":"MIT","licenseDeclared":"MIT","copyrightText":"Copyright The pip developers"}
   ],
   "relationships": [
+    {"spdxElementId":"SPDXRef-Package-NavbeaRVM","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-SubjectModel"},
     {"spdxElementId":"SPDXRef-DOCUMENT","relationshipType":"DESCRIBES","relatedSpdxElement":"SPDXRef-Package-NavbeaRVM"},
     {"spdxElementId":"SPDXRef-Package-NavbeaRVM","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-RVMModel"},
     {"spdxElementId":"SPDXRef-Package-NavbeaRVM","relationshipType":"DEPENDS_ON","relatedSpdxElement":"SPDXRef-Package-LocalMediaProtocol"},

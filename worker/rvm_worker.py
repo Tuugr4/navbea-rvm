@@ -15,6 +15,9 @@ import sys
 import time
 from pathlib import Path
 
+# Explicit sibling import also works in the isolated packaged Python (-I).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 MAGIC = b"NVF1"
 VERSION = 1
 HEADER = struct.Struct(">4sHHIQQIIIHH16sI")
@@ -148,7 +151,7 @@ class RvmEngine:
 
 
 class OnnxRvmEngine:
-    def __init__(self, model_path: Path, device_mode: str = "auto", downsample_ratio: float = 0.375, still_ratio: float = 0.5, threads: int = 0, still_max_edge: int = 0, still_threads: int = 0):
+    def __init__(self, model_path: Path, device_mode: str = "auto", downsample_ratio: float = 0.375, still_ratio: float = 0.5, threads: int = 0, still_max_edge: int = 1024, still_threads: int = 0):
         import numpy as np
         import onnxruntime as ort
         from PIL import Image
@@ -175,7 +178,8 @@ class OnnxRvmEngine:
         self.still_threads = still_threads or self.session_options.intra_op_num_threads
         self.downsample_ratio = np.asarray([downsample_ratio], dtype=np.float32)
         self.still_ratio = np.asarray([still_ratio], dtype=np.float32)
-        # Opt-in comparison profiles; zero preserves the approved fixed ratio.
+        # Bound the encoder's working resolution for high-MP stills. The guided
+        # refinement, foreground and alpha output retain the original resolution.
         self.still_max_edge = still_max_edge
         self.foreground_jpeg = None
         self.rec = [np.zeros((1, 1, 1, 1), dtype=np.float32) for _ in range(4)]
@@ -298,7 +302,7 @@ class FixtureEngine:
         return bytes([255]) * (width * height), width, height
 
 
-def serve(engine, input_stream=None, output_stream=None) -> int:
+def serve(engine, input_stream=None, output_stream=None, selector=None) -> int:
     input_stream = input_stream or sys.stdin.buffer
     output_stream = output_stream or sys.stdout.buffer
     while True:
@@ -309,10 +313,34 @@ def serve(engine, input_stream=None, output_stream=None) -> int:
                 raise ValueError("Invalid reset request")
             if hasattr(engine, "reset"):
                 engine.reset()
+            if selector: selector.reset()
             write_frame(output_stream, frame, b"", 0, 0, 4, TYPE_RESET)
+            continue
+        if frame["type"] == 7:
+            from subjects import SubjectBlocked
+            try:
+                if selector is None: raise SubjectBlocked("SUBJECT_MODEL_UNAVAILABLE")
+                command = json.loads(frame["payload"])
+                if command["action"] == "configure": selector.configure(command["policy"])
+                elif command["action"] == "lock": selector.lock()
+                elif command["action"] == "unlock": selector.unlock()
+                else: raise SubjectBlocked("SUBJECT_INVALID_CONTROL")
+                write_frame(output_stream, frame, json.dumps(selector.state).encode(), 0, 0, 4, 7)
+            except SubjectBlocked as error:
+                write_frame(output_stream, frame, json.dumps({"code": str(error), "message": str(error)}).encode(), 0, 0, 4, 4)
             continue
         if frame["type"] != TYPE_FRAME or frame["codec"] not in {CODEC_MJPEG, 3}: continue
         native_still = bool(frame["flags"] & 1)
+        support = metadata = None
+        if selector and selector.policy:
+            from subjects import SubjectBlocked
+            from PIL import Image
+            try:
+                with Image.open(io.BytesIO(frame["payload"])) as source:
+                    support, metadata = selector.evaluate(source.convert("RGB"), native_still, frame["timestamp"])
+            except SubjectBlocked as error:
+                write_frame(output_stream, frame, json.dumps({"code": str(error), "message": str(error)}).encode(), 0, 0, 4, 4)
+                continue
         # Live-view recurrent tensors are sized for the preview frame. A native
         # still is normally larger, so reset before inference as well as after;
         # DirectML cannot expand the preview state into the still resolution.
@@ -325,7 +353,12 @@ def serve(engine, input_stream=None, output_stream=None) -> int:
         if native_still and not isinstance(engine, OnnxRvmEngine) and hasattr(engine, "reset"):
             engine.reset()
         foreground = getattr(engine, "foreground_jpeg", None)
-        if native_still and frame["flags"] & 2 and foreground:
+        if metadata is not None:
+            if support is not None:
+                mask = selector.filter_alpha(mask, width, height, support)
+            meta = json.dumps(metadata, separators=(",", ":")).encode()
+            write_frame(output_stream, frame, (struct.pack(">II", len(meta), len(mask)), meta, mask, foreground or b""), width, height, 6)
+        elif native_still and frame["flags"] & 2 and foreground:
             # Private worker codec 5: uint32 mask length, GRAY8 mask, foreground JPEG.
             # Public stream subscribers continue to receive only GRAY8 frames.
             write_frame(output_stream, frame, (struct.pack(">I", len(mask)), mask, foreground), width, height, 5)
@@ -366,10 +399,11 @@ def self_test() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=os.environ.get("RVM_MODEL_PATH", ""))
+    parser.add_argument("--subject-model", default="")
     parser.add_argument("--device", choices=("auto", "cuda", "directml", "cpu"), default=os.environ.get("RVM_DEVICE", "auto"))
     parser.add_argument("--downsample-ratio", type=float, default=0.375)
     parser.add_argument("--still-ratio", type=float, default=0.5)
-    parser.add_argument("--still-max-edge", type=int, choices=(0, 512, 768, 1024), default=0)
+    parser.add_argument("--still-max-edge", type=int, choices=(0, 512, 768, 1024), default=1024)
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--still-threads", type=int, default=0)
     parser.add_argument("--fixture", action="store_true")
@@ -390,10 +424,15 @@ def main() -> int:
         if width != 128 or height != 128 or len(mask) != width * height:
             raise RuntimeError("RVM startup inference returned invalid dimensions")
         engine.reset()
+    selector = None
+    if args.subject_model:
+        from subjects import PersonDetector, SubjectSelector
+        selector = SubjectSelector(PersonDetector(args.subject_model, args.threads or 2))
+        selector.detector.detect(Image.new("RGB", (128, 128)))
     print(json.dumps({"event": "rvm-ready", "protocol": 1, "startupId": args.startup_id,
                       "inferenceVerified": not args.fixture, "provider": getattr(engine, "primary_provider", args.device)}), file=sys.stderr, flush=True)
     if args.check_runtime: return 0
-    return serve(engine)
+    return serve(engine, selector=selector)
 
 
 if __name__ == "__main__": raise SystemExit(main())

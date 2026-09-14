@@ -3,6 +3,8 @@ param(
   [string]$Tag = "v1.0.4",
   [Parameter(Mandatory=$true)][string]$UpstreamSourceZip,
   [Parameter(Mandatory=$true)][string]$UpstreamCheckpoint,
+  [Parameter(Mandatory=$true)][string]$SubjectSourceZip,
+  [Parameter(Mandatory=$true)][string]$SubjectCheckpoint,
   [Parameter(Mandatory=$true)][string]$Output,
   [switch]$WorkingTree
 )
@@ -30,6 +32,9 @@ $sourceHash = (Get-FileHash -LiteralPath $sourceZip -Algorithm SHA256).Hash.ToLo
 $checkpointHash = (Get-FileHash -LiteralPath $checkpoint -Algorithm SHA256).Hash.ToLower()
 if($sourceHash -ne $expectedSource){ throw "Upstream source checksum mismatch." }
 if($checkpointHash -ne $expectedCheckpoint){ throw "Upstream checkpoint checksum mismatch." }
+$subjects = Get-Content (Join-Path $projectRoot 'models/subjects.json') -Raw | ConvertFrom-Json
+if((Get-FileHash -LiteralPath $SubjectSourceZip).Hash.ToLower() -ne $subjects.source.sha256){throw 'Subject source checksum mismatch'}
+if((Get-FileHash -LiteralPath $SubjectCheckpoint).Hash.ToLower() -ne $subjects.checkpoint.sha256){throw 'Subject checkpoint checksum mismatch'}
 
 $scratch = Join-Path $env:TEMP ("NavbeaRVMSource-" + [guid]::NewGuid().ToString("N"))
 $treeZip = Join-Path $scratch "tree.zip"
@@ -42,6 +47,7 @@ try {
     $files=@(& git -C $projectRoot ls-files --cached --others --exclude-standard | Sort-Object -Unique)
     if($LASTEXITCODE -ne 0){throw 'Cannot enumerate corresponding source'}
     foreach($relative in $files){
+      if($relative.Replace('\','/') -match '(^|/)(test|tests|__tests__)/|\.(test|spec)\.|(^|/)test[_-]'){continue}
       if($relative -eq 'scripts/cpu-preview.cjs'){continue}
       $file=Join-Path $projectRoot $relative
       if(-not(Test-Path -LiteralPath $file -PathType Leaf)){continue}
@@ -59,6 +65,8 @@ try {
   New-Item -ItemType Directory -Path $upstream -Force | Out-Null
   Copy-Item -LiteralPath $sourceZip -Destination (Join-Path $upstream "RobustVideoMatting-v1.0.0-source.zip")
   Copy-Item -LiteralPath $checkpoint -Destination (Join-Path $upstream "rvm_mobilenetv3.pth")
+  Copy-Item -LiteralPath $SubjectSourceZip -Destination (Join-Path $upstream "yolov5-v7-source.zip")
+  Copy-Item -LiteralPath $SubjectCheckpoint -Destination (Join-Path $upstream "yolov5n-seg.pt")
   $manifest = [ordered]@{
     version = $Version
     tag = if($WorkingTree){$null}else{$Tag}
@@ -66,6 +74,7 @@ try {
     files = $fileHashes
     commit = $head
     license = "GPL-3.0-only"
+    subjectModel = $subjects
     upstream = [ordered]@{
       repository = "https://github.com/PeterL1n/RobustVideoMatting"
       release = "v1.0.0"

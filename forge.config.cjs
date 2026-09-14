@@ -9,9 +9,13 @@ module.exports = {
   },
   hooks: { postPackage: async (_config, result) => {
     const fs = require("node:fs/promises");
+    const { createHash } = require("node:crypto");
     if (!runtimeSource) throw new Error("RVM_RUNTIME_SOURCE must point to a complete relocatable runtime");
     try { await fs.access(path.join(runtimeSource,"pyvenv.cfg")); throw new Error("A virtualenv cannot be shipped as a relocatable runtime"); } catch (error) { if(error.code !== "ENOENT") throw error; }
     for (const output of result.outputPaths) {
+      const manifest = JSON.parse(await fs.readFile(path.join(output, "resources/models/subjects.json"), "utf8"));
+      const bytes = await fs.readFile(path.join(output, "resources/models", manifest.model));
+      if (createHash("sha256").update(bytes).digest("hex") !== manifest.sha256) throw new Error("Pinned subject instance model is required in every RVM package");
       const python = result.platform === "win32" ? "python.exe" : "bin/python";
       await fs.access(path.join(runtimeSource,python));
       await fs.cp(runtimeSource,path.join(output,"resources/runtime"),{recursive:true});

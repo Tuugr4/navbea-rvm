@@ -17,9 +17,9 @@ function loadProtocol() {
   for (const candidate of candidates) try { return require(candidate); } catch { /* next */ }
   throw new Error("@navbea/local-media-protocol could not be located");
 }
-const { Codec, FrameDecoder, MessageType, encodeFrame, endpointPaths, signCapability, verifyCapability } = loadProtocol();
+const { Codec, FrameDecoder, MessageType, encodeFrame, endpointPaths, signCapability, verifyCapability, normalizeSubjectPolicy } = loadProtocol();
 
-const VERSION = "1.0.6-local";
+const VERSION = "1.0.8-local";
 const API_VERSION = "1.1";
 const MAX_CONTROL_BODY = 64 * 1024;
 
@@ -64,11 +64,25 @@ class PythonWorker {
     const args = [this.options.script, "--model", this.options.model, "--device", this.options.device || "auto"];
     args.push("--startup-id", startupId);
     args.push("--downsample-ratio", String(this.options.liveRatio ?? 0.375), "--still-ratio", String(this.options.stillRatio ?? 0.5), "--threads", String(this.options.threads ?? 0));
-    args.push("--still-max-edge", String(this.options.stillMaxEdge ?? 0));
+    args.push("--still-max-edge", String(this.options.stillMaxEdge ?? 1024));
     args.push("--still-threads", String(this.options.stillThreads ?? 0));
+    if (this.options.subjectModel) args.push("--subject-model", this.options.subjectModel);
     this.child = spawn(this.options.python, args, { windowsHide: true, shell: false, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PYTHONUNBUFFERED: "1" } });
     this.child.stdout.on("data", chunk => {
-      try { for (const frame of this.decoder.push(chunk)) { const key = `${frame.streamId}:${frame.sequence}`; const pending = this.pending.get(key); pending?.resolve(frame); this.pending.delete(key); if (pending && !pending.native) this.onMask?.(frame); } }
+      try { for (let frame of this.decoder.push(chunk)) {
+        const key = `${frame.streamId}:${frame.sequence}`; const pending = this.pending.get(key); this.pending.delete(key);
+        if (frame.type === MessageType.ERROR) { const error = JSON.parse(frame.payload.toString()); pending?.reject(Object.assign(new Error(error.message), { code: error.code })); continue; }
+        if (frame.codec === 6) {
+          if (frame.payload.length < 8) throw new Error("Invalid subject response");
+          const metaLength = frame.payload.readUInt32BE(0), maskLength = frame.payload.readUInt32BE(4);
+          if (metaLength > 16384 || maskLength !== frame.width * frame.height || frame.payload.length < 8 + metaLength + maskLength) throw new Error("Invalid subject response lengths");
+          const subjectState = JSON.parse(frame.payload.subarray(8, 8 + metaLength).toString());
+          const mask = frame.payload.subarray(8 + metaLength, 8 + metaLength + maskLength), foreground = frame.payload.subarray(8 + metaLength + maskLength);
+          if (foreground.length) { const length = Buffer.alloc(4); length.writeUInt32BE(maskLength); frame = { ...frame, codec: 5, subjectState, payload: Buffer.concat([length, mask, foreground]) }; }
+          else frame = { ...frame, codec: Codec.GRAY8, subjectState, payload: mask };
+        }
+        pending?.resolve(frame); if (pending && !pending.native) this.onMask?.(frame);
+      } }
       catch (error) { this.failPending(error); this.onFailure?.(error); this.child?.kill(); }
     });
     this.child.stderr.on("data", chunk => { const line = `${new Date().toISOString()} ${chunk.toString()}\n`; if (this.options.logPath) try { fs.appendFileSync(this.options.logPath, line); } catch {} });
@@ -115,7 +129,7 @@ class PythonWorker {
       const fail = error => { const pending = this.pending.get(key); if (!pending) return; this.pending.delete(key); pending.reject(error); };
       const timeout = setTimeout(() => { const error = new Error("RVM inference timed out"); fail(error); this.onFailure?.(error); child.kill(); }, frame.flags & 1 ? 60_000 : 10_000);
       const settle = callback => value => { clearTimeout(timeout); callback(value); };
-      this.pending.set(key, { resolve: settle(resolve), reject: settle(reject), native: Boolean(frame.flags & 1) || frame.type === 5, started: process.hrtime.bigint() });
+      this.pending.set(key, { resolve: settle(resolve), reject: settle(reject), native: Boolean(frame.flags & 1) || [5, 7].includes(frame.type), started: process.hrtime.bigint() });
       const encoded = encodeFrame({ ...frame, codec: frame.codec ?? Codec.MJPEG, type: frame.type ?? MessageType.FRAME });
       if (this.options.debugDir && !this.debugSampleWritten) try { fs.mkdirSync(this.options.debugDir, { recursive: true }); fs.writeFileSync(path.join(this.options.debugDir, "input-sample.nvf1"), encoded); this.debugSampleWritten = true; } catch {}
       try { child.stdin.write(encoded, error => { if (error) fail(error); }); }
@@ -128,6 +142,14 @@ class PythonWorker {
     if (this.pending.size) throw new Error("RVM reset could not drain pending work");
     const result = await this.process({ type: 5, codec: Codec.JSON, streamId: crypto.randomUUID(), sequence: 0n, payload: Buffer.alloc(0) });
     if (result.type !== 5 || result.codec !== Codec.JSON || result.payload.length) throw new Error("RVM reset acknowledgement is invalid");
+  }
+  async subjectControl(action, policy) {
+    const deadline = Date.now() + 65_000;
+    while (this.pending.size && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    if (this.pending.size) throw new Error("Subject control queue did not drain");
+    const result = await this.process({ type: 7, codec: Codec.JSON, streamId: crypto.randomUUID(), sequence: 0n, payload: Buffer.from(JSON.stringify({ action, policy })) });
+    if (result.type !== 7 || result.codec !== Codec.JSON) throw new Error("Invalid subject control acknowledgement");
+    return JSON.parse(result.payload.toString());
   }
   stop() { this.onExit = null; this.onFailure = null; if (this.child && !this.child.killed) this.child.kill(); this.child = null; this.failPending(new Error("RVM worker stopped")); }
 }
@@ -164,7 +186,7 @@ class RvmService {
     const first = values => values.find(value => value && fs.existsSync(value)) || values.filter(Boolean)[0];
     const python = this.env.RVM_PYTHON_PATH || first(this.platform === "win32" ? [path.join(packagedRoot, "runtime", "python.exe"), path.join(packagedRoot, "runtime", "Scripts", "python.exe"), path.join(packagedRoot, ".runtime-build", "Scripts", "python.exe"), path.join(packagedRoot, ".venv", "Scripts", "python.exe")] : [path.join(packagedRoot, "runtime", "bin", "python"), path.join(packagedRoot, ".runtime-build", "bin", "python"), path.join(packagedRoot, ".venv", "bin", "python")]);
     const model = this.env.RVM_MODEL_PATH || first([path.join(packagedRoot, "models", "rvm_mobilenetv3_fp32.onnx"), path.join(packagedRoot, "rvm_mobilenetv3_fp32.onnx"), path.join(packagedRoot, "models", "rvm_mobilenetv3_fp32.torchscript"), path.join(packagedRoot, "rvm_mobilenetv3_fp32.torchscript")]);
-    return { python, script: path.join(packagedRoot, "worker", "rvm_worker.py"), model, device: this.env.RVM_DEVICE || "cpu", liveRatio: Number(this.env.RVM_LIVE_RATIO || 0.375), stillRatio: Number(this.env.RVM_STILL_RATIO || 0.5), stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 0), threads: this.env.RVM_CPU_THREADS || "auto", cpuBudget: this.env.RVM_CPU_BUDGET || "auto", logPath: path.join(this.dataRoot, "worker.log"), debugDir: this.env.RVM_DEBUG_FRAME_DIR || "" };
+    return { python, script: path.join(packagedRoot, "worker", "rvm_worker.py"), model, device: this.env.RVM_DEVICE || "cpu", liveRatio: Number(this.env.RVM_LIVE_RATIO || 0.375), stillRatio: Number(this.env.RVM_STILL_RATIO || 0.5), stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), threads: this.env.RVM_CPU_THREADS || "auto", cpuBudget: this.env.RVM_CPU_BUDGET || "auto", logPath: path.join(this.dataRoot, "worker.log"), debugDir: this.env.RVM_DEBUG_FRAME_DIR || "" };
   }
   ensureWorker() {
     if (this.workerStartPromise) return this.workerStartPromise;
@@ -177,6 +199,14 @@ class RvmService {
     if (this.stopping) return;
     if (this.fixture) { this.status = "ready"; this.metrics.device = "fixture"; return; }
     const options = this.workerOptions();
+    const subjectModel = path.resolve(path.dirname(options.script), "../models/yolov5n-seg.onnx");
+    if (fs.existsSync(subjectModel)) {
+      const manifest = require("../models/subjects.json");
+      const hash = crypto.createHash("sha256").update(await fsp.readFile(subjectModel)).digest("hex");
+      if (hash !== manifest.sha256) throw new Error("Subject model integrity check failed");
+      options.subjectModel = subjectModel;
+    }
+    this.subjectModelReady = Boolean(options.subjectModel);
     for (const target of [options.python, options.script, options.model]) await fsp.access(target);
     this.status = "starting";
     this.metrics.threadMode = "calibrating";
@@ -273,10 +303,11 @@ class RvmService {
   }
   sendMask(subscriber, frame) {
     if (!subscriber.authorized || subscriber.closed) return;
-    const encoded = encodeFrame({ type: MessageType.FRAME, codec: Codec.GRAY8, streamId: subscriber.streamId, sequence: frame.sequence, monotonicNs: frame.monotonicNs, width: frame.width, height: frame.height, payload: frame.payload });
+    const mask = encodeFrame({ type: MessageType.FRAME, codec: Codec.GRAY8, streamId: subscriber.streamId, sequence: frame.sequence, monotonicNs: frame.monotonicNs, width: frame.width, height: frame.height, payload: frame.payload });
+    const encoded = frame.subjectState ? Buffer.concat([encodeFrame({ type: MessageType.SUBJECT_STATE, codec: Codec.JSON, streamId: subscriber.streamId, sequence: frame.sequence, monotonicNs: frame.monotonicNs, payload: Buffer.from(JSON.stringify(frame.subjectState)) }), mask]) : mask;
     writeLatestBounded(subscriber, encoded, () => { this.metrics.dropped += 1; });
   }
-  health() { return { status: this.status, service: "rvm", sourceTimestamps: "camera-monotonic", version: VERSION, build: buildInfo, apiVersion: API_VERSION, uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000), errorCode: this.errorCode, error: this.error, sourceSession: this.sourceSession?.id || null, workerState: this.worker ? (this.stillCaptureBusy ? "native" : this.resetPromise ? "resetting" : "warm") : this.fixture ? "fixture" : "idle", modelSha256: this.workerProfile?.modelHash || null, metrics: { frames: this.metrics.frames, dropped: this.metrics.dropped, maskFps: this.metrics.maskFps, inferenceMs: this.metrics.inferenceMs === null ? null : Number(this.metrics.inferenceMs.toFixed(2)), device: this.metrics.device, threads: this.metrics.threads ?? null, threadMode: this.metrics.threadMode ?? null, availableProcessors: this.metrics.availableProcessors ?? null, physicalCores: this.metrics.physicalCores ?? null, cpuBudget: this.workerProfile?.budget ?? null, stillThreads: this.metrics.stillThreads ?? null, stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 0), stillRatio: Number(this.env.RVM_STILL_RATIO || .5), lastStill: this.metrics.lastStill || null } }; }
+  health() { return { status: this.status, service: "rvm", sourceTimestamps: "camera-monotonic", version: VERSION, build: buildInfo, apiVersion: API_VERSION, uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000), errorCode: this.errorCode, error: this.error, sourceSession: this.sourceSession?.id || null, workerState: this.worker ? (this.stillCaptureBusy ? "native" : this.resetPromise ? "resetting" : "warm") : this.fixture ? "fixture" : "idle", modelSha256: this.workerProfile?.modelHash || null, metrics: { frames: this.metrics.frames, dropped: this.metrics.dropped, maskFps: this.metrics.maskFps, inferenceMs: this.metrics.inferenceMs === null ? null : Number(this.metrics.inferenceMs.toFixed(2)), device: this.metrics.device, threads: this.metrics.threads ?? null, threadMode: this.metrics.threadMode ?? null, availableProcessors: this.metrics.availableProcessors ?? null, physicalCores: this.metrics.physicalCores ?? null, cpuBudget: this.workerProfile?.budget ?? null, stillThreads: this.metrics.stillThreads ?? null, stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), stillRatio: Number(this.env.RVM_STILL_RATIO || .5), lastStill: this.metrics.lastStill || null } }; }
   authorized(req) { const a = Buffer.from(String(req.headers["x-navbea-client-token"] || "")); const b = Buffer.from(String(this.clientSecret)); return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b); }
   lifecycle(action) {
     const work = (this.lifecycleTail || Promise.resolve()).catch(() => {}).then(action);
@@ -285,9 +316,13 @@ class RvmService {
   }
   createSession(options = {}) { return this.lifecycle(() => this.openSession(options)); }
   async openSession(options) {
+    const policy = options.subjectSelection === undefined ? null : normalizeSubjectPolicy(options.subjectSelection);
+    if (this.subjectOwner) throw new Error("A subject selection session already owns the pipeline");
+    if (policy && this.sessions.size) throw new Error("Close existing RVM sessions before selecting subjects");
     clearTimeout(this.idleTimer);
     if (this.resetPromise) await this.resetPromise;
     await this.ensureWorker();
+    if (policy && (!this.subjectModelReady || this.fixture)) throw new Error("Subject instance model is unavailable");
     if (this.stopping) throw new Error("RVM service is stopping");
     if (this.sessions.size >= 16) throw new Error("Too many RVM sessions");
     if (options.resetState && !this.fixture && this.worker) {
@@ -300,13 +335,28 @@ class RvmService {
     const capability = signCapability({ aud: "rvm", scope: "stream:read", session: id, streamId: maskStreamId, exp }, this.capabilitySecret);
     const item = { id, sourceStreamId: this.sourceSession.streamId, maskStreamId, maskEndpoint: this.paths.stream, capability, expiresAt: new Date(exp * 1000).toISOString() };
     this.sessions.set(id, item);
+    if (policy) {
+      this.subjectOwner = id;
+      try { await this.controlSubjects(id, "configure", policy); }
+      catch (error) { this.subjectOwner = null; this.sessions.delete(id); await this.resetPipeline(); throw error; }
+    }
     setTimeout(() => { if (![...this.subscribers].some(subscriber => subscriber.sessionId === id)) void this.deleteSession(id).catch(error => this.scheduleWorkerRestart(error)); }, 125_000).unref?.();
     return item;
   }
   deleteSession(id) { return this.lifecycle(() => this.closeSession(id)); }
+  async controlSubjects(id, action, policy) {
+    if (!id || id !== this.subjectOwner || !this.sessions.has(id)) throw new Error("Subject session mismatch");
+    if (this.stillTask || this.resetPromise) throw new Error("Subject selection is busy");
+    const work = this.worker.subjectControl(action, policy);
+    this.resetPromise = work;
+    this.latestSourceFrame = null;
+    try { const state = await work; this.subjectLock = state.lockId || null; return state; }
+    finally { if (this.resetPromise === work) this.resetPromise = null; }
+  }
   async closeSession(id) {
     const existed = this.sessions.delete(id);
     if (!existed) return false;
+    if (this.subjectOwner === id) { this.subjectOwner = null; this.subjectLock = null; }
     for (const subscriber of this.subscribers) if (subscriber.sessionId === id) subscriber.socket.destroy();
     if (!this.sessions.size) await this.resetPipeline();
     return true;
@@ -335,7 +385,8 @@ class RvmService {
       throw error;
     }).finally(() => { if (this.resetPromise === work) this.resetPromise = null; });
   }
-  stillMatte(cameraArtifact) {
+  stillMatte(cameraArtifact, selection) {
+    if (this.subjectOwner && (selection?.sessionId !== this.subjectOwner || !this.subjectLock || selection?.lockId !== this.subjectLock)) return Promise.reject(new Error("Subject lock is required for native verification"));
     if (this.stillTask || this.resetPromise) return Promise.reject(new Error("RVM native capture is busy"));
     const retainedBytes = [...this.artifacts.values()].reduce((sum, item) => sum + item.payload.length, 0);
     if (this.artifacts.size > 6 || retainedBytes > 192 * 1024 * 1024) return Promise.reject(new Error("Read or expire previous native artifacts before requesting another capture"));
@@ -365,6 +416,7 @@ class RvmService {
         queueMs = performance.now() - queueStartedAt;
         mask = await this.worker.process(source);
       }
+    if (this.subjectOwner && (!mask.subjectState?.verifiedNative || mask.subjectState.lockId !== this.subjectLock)) throw new Error("Native subject verification is missing");
     let foregroundArtifact;
     if (mask.codec === 5) {
       const maskLength = mask.payload.readUInt32BE(0);
@@ -382,19 +434,21 @@ class RvmService {
     const id = crypto.randomUUID(), exp = Math.floor(Date.now() / 1000) + 120;
     const artifact = { id, payload: mask.payload, width: mask.width, height: mask.height, byteLength: mask.payload.length, mimeType: "application/x-navbea-gray8", expiresAt: new Date(exp * 1000).toISOString() };
     artifact.readCapability = signCapability({ aud: "rvm", scope: "artifact:read", artifact: id, exp }, this.capabilitySecret);
-    this.artifacts.set(id, artifact); setTimeout(() => this.artifacts.delete(id), 125_000).unref?.(); const { payload: _payload, ...publicItem } = artifact; return { ...publicItem, foregroundArtifact, captureId: cameraArtifact.captureId || cameraArtifact.id, timings };
+    this.artifacts.set(id, artifact); setTimeout(() => this.artifacts.delete(id), 125_000).unref?.(); const { payload: _payload, ...publicItem } = artifact; return { ...publicItem, foregroundArtifact, subjectVerification: mask.subjectState, captureId: cameraArtifact.captureId || cameraArtifact.id, timings };
     } finally { this.stillCaptureBusy = false; }
   }
   async handleControl(req, res) {
     const url = new URL(req.url, "http://local");
     try {
-      if (req.method === "GET" && url.pathname === "/v1/health") return json(res, 200, this.health());
+      if (req.method === "GET" && url.pathname === "/v1/health") return json(res, 200, { ...this.health(), subjectSelection: this.subjectModelReady ? { version: 1, modes: ["area", "tracking", "all"], nativeVerification: true, occlusionGuard: true } : null });
       if (!this.authorized(req)) return json(res, 401, { error: "Unauthorized" });
       if (req.method === "GET" && url.pathname === "/v1/capabilities") return json(res, 200, { apiVersion: API_VERSION, input: { profile: "matting-720p24", codec: "mjpeg", minimumFps: 24 }, output: { codec: "gray8", sequenceAligned: true, maximumLagMs: 150 }, nativeStill: true });
       if (req.method === "POST" && url.pathname === "/v1/sessions") return json(res, 201, await this.createSession(await readJson(req)));
       const sessionMatch = url.pathname.match(/^\/v1\/sessions\/([a-f0-9-]+)$/);
       if (req.method === "DELETE" && sessionMatch) return json(res, 200, { status: await this.deleteSession(sessionMatch[1]) ? "deleted" : "already-absent" });
-      if (req.method === "POST" && url.pathname === "/v1/still-mattes") { const body = await readJson(req); return json(res, 201, await this.stillMatte(body.cameraArtifact)); }
+      const subjectMatch = url.pathname.match(/^\/v1\/sessions\/([a-f0-9-]+)\/subjects\/(lock|unlock)$/);
+      if (req.method === "POST" && subjectMatch) return json(res, 200, await this.lifecycle(() => this.controlSubjects(subjectMatch[1], subjectMatch[2])));
+      if (req.method === "POST" && url.pathname === "/v1/still-mattes") { const body = await readJson(req); return json(res, 201, await this.stillMatte(body.cameraArtifact, body)); }
       const match = url.pathname.match(/^\/v1\/artifacts\/([a-f0-9-]+)$/);
       if (req.method === "GET" && match) {
         const item = this.artifacts.get(match[1]); if (!item) return json(res, 404, { error: "Artifact not found" });

@@ -11,10 +11,14 @@ if (!/^[a-f0-9]{64}$/.test(manifest.sha256)) throw new Error("Pinned model SHA-2
 const modelPath = path.join(root, "models", manifest.model); await stat(modelPath);
 const modelHash = createHash("sha256").update(await readFile(modelPath)).digest("hex");
 if (modelHash !== manifest.sha256) throw new Error("RVM model checksum mismatch");
+const subjects = JSON.parse(await readFile(path.join(root, "models", "subjects.json"), "utf8"));
+const subjectHash = createHash("sha256").update(await readFile(path.join(root, "models", subjects.model))).digest("hex");
+if (subjectHash !== subjects.sha256) throw new Error("Subject instance model checksum mismatch");
 const required = [
   "README.md", "SOURCE_OFFER.md", "CHANGES.md", "THIRD_PARTY_NOTICES.md", "SBOM.spdx.json",
   "THIRD_PARTY_LICENSES/React-ReactDOM-Scheduler-MIT.txt", "THIRD_PARTY_LICENSES/Phosphor-Icons-MIT.txt",
-  "local-media-protocol/LICENSE", "worker/rvm_worker.py",
+  "local-media-protocol/LICENSE", "local-media-protocol/subjects.cjs", "worker/rvm_worker.py", "worker/subjects.py",
+  "THIRD_PARTY_LICENSES/YOLOv5-GPL-3.0.txt", "THIRD_PARTY_LICENSES/YOLOv5-NOTICE.txt",
 ];
 for (const item of required) await stat(path.join(root, item));
 const offer = await readFile(path.join(root, "SOURCE_OFFER.md"), "utf8");

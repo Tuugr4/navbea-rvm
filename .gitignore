@@ -1,4 +1,6 @@
 node_modules/
+.superdesign/
+.pytest_cache/
 
 # Local-only automated tests and test tooling
 test/

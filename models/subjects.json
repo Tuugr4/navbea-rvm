@@ -1,0 +1,11 @@
+{
+  "model": "yolov5n-seg.onnx",
+  "sha256": "6ce62b250fbeca74ad493697b015fef043a6b3248a4d7f301320c4066de13d0d",
+  "license": "GPL-3.0-only",
+  "repository": "https://github.com/ultralytics/yolov5",
+  "revision": "915bbf294bb74c859f0b41f1c23bc395014ea679",
+  "source": { "url": "https://codeload.github.com/ultralytics/yolov5/zip/915bbf294bb74c859f0b41f1c23bc395014ea679", "sha256": "5aac5c8c40f89831fee611621b5ef3dbd7a7633278713b4dd0d059e1a631c7b0" },
+  "checkpoint": { "url": "https://github.com/ultralytics/yolov5/releases/download/v7.0/yolov5n-seg.pt", "sha256": "1ee00e5e14e3863898c5446c62734776759e29be08fd1c174774992f7aaa9985" },
+  "export": { "torch": "2.5.1+cpu", "torchvision": "0.20.1+cpu", "onnx": "1.16.2", "numpy": "1.26.4", "opset": 12, "dynamic": true, "imageSize": 640 },
+  "inference": { "liveSize": 320, "nativeSize": 640, "provider": "CPUExecutionProvider", "maximumThreads": 2 }
+}
