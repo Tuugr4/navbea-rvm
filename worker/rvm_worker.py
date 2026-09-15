@@ -172,6 +172,10 @@ class OnnxRvmEngine:
         self.run_options = ort.RunOptions()
         self.run_options.only_execute_path_to_fetches = True
         self.session = ort.InferenceSession(self.model_path, sess_options=self.session_options, providers=providers)
+        self.input_types = {item.name: item.type for item in self.session.get_inputs()}
+        if self.input_types.get("src") not in ("tensor(float)", "tensor(float16)"):
+            raise ValueError("RVM model requires FP32 or FP16 inputs")
+        self.tensor_dtype = np.float16 if self.input_types["src"] == "tensor(float16)" else np.float32
         self.primary_provider = providers[0]
         self.cpu_session = None
         self.native_session = None
@@ -182,11 +186,11 @@ class OnnxRvmEngine:
         # refinement, foreground and alpha output retain the original resolution.
         self.still_max_edge = still_max_edge
         self.foreground_jpeg = None
-        self.rec = [np.zeros((1, 1, 1, 1), dtype=np.float32) for _ in range(4)]
+        self.rec = [np.zeros((1, 1, 1, 1), dtype=self.tensor_dtype) for _ in range(4)]
         self.rec_initialized = False
 
     def reset(self):
-        self.rec = [self.np.zeros((1, 1, 1, 1), dtype=self.np.float32) for _ in range(4)]
+        self.rec = [self.np.zeros((1, 1, 1, 1), dtype=self.tensor_dtype) for _ in range(4)]
         self.rec_initialized = False
         self.foreground_jpeg = None
         if self.native_session is not None:
@@ -197,7 +201,7 @@ class OnnxRvmEngine:
             trim.only_execute_path_to_fetches = True
             trim.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
             self.native_session.run(["pha"], {
-                "src": self.np.zeros((1, 3, 128, 128), dtype=self.np.float32),
+                "src": self.np.zeros((1, 3, 128, 128), dtype=self.tensor_dtype),
                 "r1i": self.rec[0], "r2i": self.rec[1], "r3i": self.rec[2], "r4i": self.rec[3],
                 "downsample_ratio": self.still_ratio,
             }, trim)
@@ -230,6 +234,10 @@ class OnnxRvmEngine:
             "src": src, "r1i": rec[0], "r2i": rec[1], "r3i": rec[2],
             "r4i": rec[3], "downsample_ratio": self.downsample_ratio if ratio is None else ratio,
         }
+        for name, value in feeds.items():
+            dtype = self.np.float16 if self.input_types.get(name) == "tensor(float16)" else self.np.float32
+            if value.dtype != dtype:
+                feeds[name] = value.astype(dtype, copy=False)
         if ratio is None:
             # Live subscribers consume alpha only. Do not fetch the full RGB
             # foreground output until a native still actually needs it.
@@ -241,6 +249,8 @@ class OnnxRvmEngine:
         # ORT owns these independent output arrays. They are no longer consumed
         # by inference; keep rounding/clipping identical while avoiding 3 large
         # temporary float tensors. Never apply this to recurrent output arrays.
+        if values.dtype == self.np.float16:
+            values = values.astype(self.np.float32)
         self.np.clip(values, 0, 1, out=values)
         self.np.multiply(values, 255.0, out=values)
         self.np.rint(values, out=values)
@@ -252,7 +262,7 @@ class OnnxRvmEngine:
             scale = min(1280 / image.width, 720 / image.height)
             image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), self.Image.Resampling.BILINEAR)
         width, height = image.size
-        src = self.np.empty((1, 3, height, width), dtype=self.np.float32)
+        src = self.np.empty((1, 3, height, width), dtype=self.tensor_dtype)
         src[0] = self.np.asarray(image).transpose(2, 0, 1)
         src *= 1.0 / 255.0
         image.close()
@@ -261,7 +271,7 @@ class OnnxRvmEngine:
             # Keep the fast DirectML live session intact. Native stills use a
             # fresh CPU recurrence so their different resolution cannot crash
             # the DirectML Expand nodes.
-            native_rec = [self.np.zeros((1, 1, 1, 1), dtype=self.np.float32) for _ in range(4)]
+            native_rec = [self.np.zeros((1, 1, 1, 1), dtype=self.tensor_dtype) for _ in range(4)]
             session = self._native()
             ratio = self.np.asarray([min(float(self.still_ratio[0]), self.still_max_edge / max(width, height))], dtype=self.np.float32) if self.still_max_edge else self.still_ratio
             outputs = self._run(session, src, native_rec, ratio)
@@ -288,6 +298,7 @@ class OnnxRvmEngine:
                 # move this worker to CPU without killing the supervisor pipe.
                 self.session = self._cpu()
                 self.primary_provider = "CPUExecutionProvider"
+                print(json.dumps({"event":"provider-change","provider":self.primary_provider,"reason":"DirectML inference fallback"}),file=sys.stderr,flush=True)
                 self.reset()
                 outputs = self._run(self.session, src, self.rec)
             self.rec = list(outputs[2:6])
@@ -410,7 +421,13 @@ def main() -> int:
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--startup-id", default="")
     parser.add_argument("--check-runtime", action="store_true")
+    parser.add_argument("--check-model", action="store_true")
+    parser.add_argument("--inspect-runtime", action="store_true")
     args = parser.parse_args()
+    if args.inspect_runtime:
+        import onnxruntime as ort
+        print(json.dumps({"providers":ort.get_available_providers(),"onnxruntime":ort.__version__}))
+        return 0
     if not 0 < args.downsample_ratio <= 1 or not 0 < args.still_ratio <= 1 or not 0 <= args.threads <= (os.cpu_count() or 1) or not 0 <= args.still_threads <= (os.cpu_count() or 1):
         parser.error("Ratios must be in (0, 1]; threads must be 0 (automatic) or an available processor count")
     if args.self_test: return self_test()
@@ -424,6 +441,19 @@ def main() -> int:
         if width != 128 or height != 128 or len(mask) != width * height:
             raise RuntimeError("RVM startup inference returned invalid dimensions")
         engine.reset()
+        if args.check_model:
+            started = time.perf_counter()
+            sample = io.BytesIO()
+            Image.new("RGB", (1280,720), (80,100,120)).save(sample,format="JPEG")
+            live, width, height = engine.process(sample.getvalue())
+            if (width,height)!=(1280,720) or len(live)!=width*height:
+                raise RuntimeError("Model live validation failed")
+            native, width, height = engine.process(sample.getvalue(),native=True)
+            if len(native)!=width*height or not engine.foreground_jpeg:
+                raise RuntimeError("Model native validation failed")
+            engine.reset()
+            print(json.dumps({"verified":True,"provider":engine.primary_provider,"precision":"fp16" if engine.input_types["src"]=="tensor(float16)" else "fp32","probeMs":round((time.perf_counter()-started)*1000),"width":width,"height":height,"providers":engine.ort.get_available_providers()}))
+            return 0
     selector = None
     if args.subject_model:
         from subjects import PersonDetector, SubjectSelector

@@ -1,0 +1,3 @@
+#!/bin/sh
+set -eu
+exec /usr/bin/env -i PATH=/usr/bin:/bin ELECTRON_RUN_AS_NODE=1 /usr/lib/navbea-rvm/navbea-rvm /usr/lib/navbea-rvm/resources/deploy/linux/model-admin-request.cjs "$@"

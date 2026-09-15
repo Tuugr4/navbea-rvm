@@ -6,8 +6,11 @@ const http = require("node:http");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, execFile } = require("node:child_process");
 const { resolveCpuProfile } = require("./cpu-profile.cjs");
+const { ModelManager } = require('./model-manager.cjs');
+const { runModelProbe } = require('./model-probe.cjs');
+const { LivePreview } = require('./live-preview.cjs');
 
 function loadProtocol() {
   const candidates = [
@@ -19,7 +22,7 @@ function loadProtocol() {
 }
 const { Codec, FrameDecoder, MessageType, encodeFrame, endpointPaths, signCapability, verifyCapability, normalizeSubjectPolicy } = loadProtocol();
 
-const VERSION = "1.0.8-local";
+const VERSION = "1.1.1-local";
 const API_VERSION = "1.1";
 const MAX_CONTROL_BODY = 64 * 1024;
 
@@ -78,7 +81,7 @@ class PythonWorker {
           if (metaLength > 16384 || maskLength !== frame.width * frame.height || frame.payload.length < 8 + metaLength + maskLength) throw new Error("Invalid subject response lengths");
           const subjectState = JSON.parse(frame.payload.subarray(8, 8 + metaLength).toString());
           const mask = frame.payload.subarray(8 + metaLength, 8 + metaLength + maskLength), foreground = frame.payload.subarray(8 + metaLength + maskLength);
-          if (foreground.length) { const length = Buffer.alloc(4); length.writeUInt32BE(maskLength); frame = { ...frame, codec: 5, subjectState, payload: Buffer.concat([length, mask, foreground]) }; }
+          if (foreground.length) frame = { ...frame, codec: Codec.GRAY8, subjectState, payload: mask, foregroundPayload:foreground };
           else frame = { ...frame, codec: Codec.GRAY8, subjectState, payload: mask };
         }
         pending?.resolve(frame); if (pending && !pending.native) this.onMask?.(frame);
@@ -95,7 +98,6 @@ class PythonWorker {
       const timer = setTimeout(() => { settled = true; reject(new Error("RVM model readiness timed out")); this.child?.kill(); }, this.options.startupTimeoutMs || 120_000);
       this.child.stderr.setEncoding("utf8");
       this.child.stderr.on("data", chunk => {
-        if (settled) return;
         diagnostic += chunk;
         if (diagnostic.length > 64 * 1024) { diagnostic = ""; return; }
         let newline;
@@ -103,7 +105,9 @@ class PythonWorker {
           const line = diagnostic.slice(0, newline); diagnostic = diagnostic.slice(newline + 1);
           try {
             const event = JSON.parse(line);
-            if (event.event === "rvm-ready" && event.protocol === 1 && event.startupId === startupId && event.inferenceVerified === true) {
+            if(event.event==='provider-change'&&typeof event.provider==='string'){this.actualProvider=event.provider;this.onProvider?.(event.provider,event.reason);}
+            if (!settled && event.event === "rvm-ready" && event.protocol === 1 && event.startupId === startupId && event.inferenceVerified === true) {
+              this.actualProvider=event.provider;this.onProvider?.(event.provider);
               settled = true; clearTimeout(timer); resolve();
             }
           } catch { /* Non-protocol Python diagnostics are logged separately. */ }
@@ -160,7 +164,7 @@ class RvmService {
     this.paths = options.paths || endpointPaths("rvm", this.platform, this.env); this.cameraPaths = options.cameraPaths || endpointPaths("camera", this.platform, this.env);
     this.dataRoot = options.dataRoot || defaultDataRoot(this.platform, this.env); this.cameraDataRoot = options.cameraDataRoot || cameraDataRoot(this.platform, this.env);
     this.fixture = options.fixture === true || this.env.NAVBEA_RVM_FIXTURE === "1";
-    this.clientSecret = options.clientSecret || null; this.capabilitySecret = options.capabilitySecret || null; this.cameraClientToken = options.cameraClientToken || this.env.NAVBEA_CAMERA_CLIENT_TOKEN || null;
+    this.clientSecret = options.clientSecret || null; this.adminSecret=options.adminSecret||null; this.capabilitySecret = options.capabilitySecret || null; this.cameraClientToken = options.cameraClientToken || this.env.NAVBEA_CAMERA_CLIENT_TOKEN || null;
     this.controlServer = null; this.streamServer = null; this.worker = null; this.cameraSocket = null;
     this.sessions = new Map(); this.subscribers = new Set(); this.artifacts = new Map(); this.startedAt = Date.now();
     this.status = "starting"; this.errorCode = null; this.error = null; this.sourceSession = null;
@@ -168,11 +172,16 @@ class RvmService {
     this.sequenceTimes = new Map(); this.latestSourceFrame = null;
     this.workerRestarts = 0; this.ownedEndpoints = new Set();
     this.resetPromise = null; this.stillTask = null; this.workerStartPromise = null; this.idleTimer = null;
+    this.modelAbort=new AbortController();
+    this.preview = new LivePreview(this);
   }
   async ensureStorage() {
     await fsp.mkdir(this.dataRoot, { recursive: true, mode: 0o755 });
     const load = async (target, value) => { if (value) return value; const mode = this.platform !== "win32" && path.basename(target) === "client-token.txt" ? 0o644 : 0o600; try { const existing = (await fsp.readFile(target, "utf8")).trim(); if (existing.length < 32) throw new Error("Invalid local service credential"); if (this.platform !== "win32") await fsp.chmod(target, mode); return existing; } catch (error) { if (error.code !== "ENOENT") throw error; } const created = crypto.randomBytes(48).toString("base64url"); await fsp.writeFile(target, `${created}\n`, { mode, flag: "wx" }); return created; };
     this.clientSecret = await load(path.join(this.dataRoot, "client-token.txt"), this.clientSecret);
+    const adminFile=path.join(this.dataRoot,'admin-token.txt');
+    this.adminSecret = await load(adminFile,this.adminSecret);
+    if(this.platform==='win32'&&!this.fixture&&this.env.NAVBEA_RVM_DEV!=='1')await new Promise((resolve,reject)=>execFile(path.join(this.env.SystemRoot||'C:\\Windows','System32','icacls.exe'),[adminFile,'/inheritance:r','/grant:r','*S-1-5-18:(F)','*S-1-5-32-544:(F)'],{windowsHide:true,timeout:10000},error=>error?reject(error):resolve()));
     this.capabilitySecret = await load(path.join(this.dataRoot, "capability-secret.txt"), this.capabilitySecret);
     const deadline = Date.now() + Number(this.env.NAVBEA_CAMERA_STARTUP_WAIT_MS || 30_000);
     while (!this.cameraClientToken) {
@@ -185,8 +194,9 @@ class RvmService {
     const packagedRoot = this.env.NAVBEA_RVM_ROOT || path.resolve(__dirname, "..");
     const first = values => values.find(value => value && fs.existsSync(value)) || values.filter(Boolean)[0];
     const python = this.env.RVM_PYTHON_PATH || first(this.platform === "win32" ? [path.join(packagedRoot, "runtime", "python.exe"), path.join(packagedRoot, "runtime", "Scripts", "python.exe"), path.join(packagedRoot, ".runtime-build", "Scripts", "python.exe"), path.join(packagedRoot, ".venv", "Scripts", "python.exe")] : [path.join(packagedRoot, "runtime", "bin", "python"), path.join(packagedRoot, ".runtime-build", "bin", "python"), path.join(packagedRoot, ".venv", "bin", "python")]);
-    const model = this.env.RVM_MODEL_PATH || first([path.join(packagedRoot, "models", "rvm_mobilenetv3_fp32.onnx"), path.join(packagedRoot, "rvm_mobilenetv3_fp32.onnx"), path.join(packagedRoot, "models", "rvm_mobilenetv3_fp32.torchscript"), path.join(packagedRoot, "rvm_mobilenetv3_fp32.torchscript")]);
-    return { python, script: path.join(packagedRoot, "worker", "rvm_worker.py"), model, device: this.env.RVM_DEVICE || "cpu", liveRatio: Number(this.env.RVM_LIVE_RATIO || 0.375), stillRatio: Number(this.env.RVM_STILL_RATIO || 0.5), stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), threads: this.env.RVM_CPU_THREADS || "auto", cpuBudget: this.env.RVM_CPU_BUDGET || "auto", logPath: path.join(this.dataRoot, "worker.log"), debugDir: this.env.RVM_DEBUG_FRAME_DIR || "" };
+    const selected=this.models?.active;
+    const model = selected ? this.models.file(this.models.entry(selected.id)) : this.env.RVM_MODEL_PATH || first([path.join(packagedRoot, "models", "rvm_mobilenetv3_fp32.onnx"), path.join(packagedRoot, "rvm_mobilenetv3_fp32.onnx"), path.join(packagedRoot, "models", "rvm_mobilenetv3_fp32.torchscript"), path.join(packagedRoot, "rvm_mobilenetv3_fp32.torchscript")]);
+    return { python, script: path.join(packagedRoot, "worker", "rvm_worker.py"), model, device: selected&&selected.id!==this.models.catalogue.defaultModel?selected.device:this.env.RVM_DEVICE || "cpu", liveRatio: Number(this.env.RVM_LIVE_RATIO || 0.375), stillRatio: Number(this.env.RVM_STILL_RATIO || 0.5), stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), threads: this.env.RVM_CPU_THREADS || "auto", cpuBudget: this.env.RVM_CPU_BUDGET || "auto", logPath: path.join(this.dataRoot, "worker.log"), debugDir: this.env.RVM_DEBUG_FRAME_DIR || "" };
   }
   ensureWorker() {
     if (this.workerStartPromise) return this.workerStartPromise;
@@ -198,6 +208,7 @@ class RvmService {
   async startWorker() {
     if (this.stopping) return;
     if (this.fixture) { this.status = "ready"; this.metrics.device = "fixture"; return; }
+    if(this.modelManagerError)throw new Error(this.modelManagerError);
     const options = this.workerOptions();
     const subjectModel = path.resolve(path.dirname(options.script), "../models/yolov5n-seg.onnx");
     if (fs.existsSync(subjectModel)) {
@@ -222,6 +233,7 @@ class RvmService {
     this.metrics.device = options.device;
     this.worker = new PythonWorker(options);
     const worker = this.worker;
+    worker.onProvider=(provider,reason)=>{if(this.worker!==worker)return;this.metrics.device=provider;this.metrics.providerFallback=reason||null;};
     worker.onMask = frame => this.acceptMask(frame);
     worker.onFailure = error => { this.status = "unavailable"; this.errorCode = "RVM_WORKER_PIPE_FAILED"; this.error = error.message; };
     const startedAt = Date.now();
@@ -229,6 +241,7 @@ class RvmService {
     try { await worker.start(); }
     catch (error) { worker.stop(); if (this.worker === worker) this.worker = null; throw error; }
     if (this.stopping) { worker.stop(); this.worker = null; return; }
+    this.loadedModelId=this.models?.active.id;
     this.status = "ready"; this.errorCode = null; this.error = null;
   }
   cameraRequest(method, pathname, body, authorization) {
@@ -284,6 +297,7 @@ class RvmService {
     if (this.stillCaptureBusy || this.resetPromise || !this.cameraSocket) { this.metrics.dropped += 1; return; }
     if (this.sequenceTimes.size >= 1) { if (this.latestSourceFrame) this.metrics.dropped += 1; this.latestSourceFrame = frame; return; }
     const started = process.hrtime.bigint(); this.sequenceTimes.set(frame.sequence.toString(), started);
+    this.preview.offerSource(frame);
     if (this.fixture) {
       const width = 1280, height = 720;
       this.acceptMask({ ...frame, width, height, codec: Codec.GRAY8, payload: Buffer.alloc(width * height, 255) });
@@ -295,6 +309,7 @@ class RvmService {
   acceptMask(frame) {
     const key = frame.sequence.toString(); const started = this.sequenceTimes.get(key); this.sequenceTimes.delete(key);
     if (this.resetPromise || this.stopping) return;
+    this.preview.acceptMask(frame);
     if (started) this.metrics.inferenceMs = Number(process.hrtime.bigint() - started) / 1e6;
     this.metrics.frames += 1; this.status = "ready"; this.errorCode = null; this.error = null;
     const now = Date.now(); this.metrics.windowStarted ||= now; this.metrics.windowFrames = (this.metrics.windowFrames || 0) + 1;
@@ -308,14 +323,32 @@ class RvmService {
     writeLatestBounded(subscriber, encoded, () => { this.metrics.dropped += 1; });
   }
   health() { return { status: this.status, service: "rvm", sourceTimestamps: "camera-monotonic", version: VERSION, build: buildInfo, apiVersion: API_VERSION, uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000), errorCode: this.errorCode, error: this.error, sourceSession: this.sourceSession?.id || null, workerState: this.worker ? (this.stillCaptureBusy ? "native" : this.resetPromise ? "resetting" : "warm") : this.fixture ? "fixture" : "idle", modelSha256: this.workerProfile?.modelHash || null, metrics: { frames: this.metrics.frames, dropped: this.metrics.dropped, maskFps: this.metrics.maskFps, inferenceMs: this.metrics.inferenceMs === null ? null : Number(this.metrics.inferenceMs.toFixed(2)), device: this.metrics.device, threads: this.metrics.threads ?? null, threadMode: this.metrics.threadMode ?? null, availableProcessors: this.metrics.availableProcessors ?? null, physicalCores: this.metrics.physicalCores ?? null, cpuBudget: this.workerProfile?.budget ?? null, stillThreads: this.metrics.stillThreads ?? null, stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), stillRatio: Number(this.env.RVM_STILL_RATIO || .5), lastStill: this.metrics.lastStill || null } }; }
-  authorized(req) { const a = Buffer.from(String(req.headers["x-navbea-client-token"] || "")); const b = Buffer.from(String(this.clientSecret)); return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b); }
+  authorized(req,role='client') { const a = Buffer.from(String(req.headers[role==='admin'?'x-navbea-admin-token':"x-navbea-client-token"] || "")); const secret=role==='admin'?this.adminSecret:this.clientSecret; if(!secret)return false;const b = Buffer.from(String(secret)); return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b); }
+  modelsStatus(){if(this.modelsInitializing)return{available:false,error:'Modeller kontrol ediliyor.'};if(!this.models)return{available:false,error:'Model yönetimi henüz hazır değil.'};const status=this.models.snapshot();const activeId=this.loadedModelId||status.active.id;return {...status,available:true,active:{...status.active,id:activeId},models:status.models.map(item=>({...item,active:item.id===activeId})),switching:Boolean(this.modelChange)||status.switching,activeSessions:this.sessions.size,actualProvider:this.metrics.device};}
+  changeModel(id){return this.lifecycle(async()=>{
+    if(!this.models)throw Error('Model yönetimi hazır değil.');
+    if(this.preview.active)throw Error('Model değiştirmek için canlı önizlemeyi kapatın.');
+    if(this.sessions.size||this.stillTask||this.resetPromise||this.workerStartPromise)throw Error('Model değiştirmek için aktif çekim oturumunun bitmesini bekleyin.');
+    const previous={...this.models.active};this.modelChange=true;clearTimeout(this.idleTimer);clearTimeout(this.workerRestartTimer);this.workerRestartTimer=null;
+    try{
+      const cameraHealth=await this.cameraRequest('GET','/v1/health').catch(()=>null);const native=cameraHealth?.nativeStill;
+      if(cameraHealth?.operationState)throw Error('Kamera bir işlem yürütüyor. Model değişimi için kamera testinin veya çekimin bitmesini bekleyin.');
+      if(native?.width*native?.height>this.models.limits(id).maxNativePixels)throw Error('Bu model seçili kameranın fotoğraf çözünürlüğü için doğrulanmış sınırı aşıyor. Mevcut modeli kullanın.');
+      await this.models.activate(id);if(previous.id===this.models.active.id)return this.modelsStatus();
+      this.worker?.stop();this.worker=null;this.workerProfile=null;this.workerRestarts=0;
+      try{await this.startWorker();}
+      catch(error){await this.models.restore(previous,'Yeni model başlatılamadı; önceki model geri yüklendi. '+error.message);this.worker?.stop();this.worker=null;this.workerProfile=null;await this.startWorker();throw error;}
+      return this.modelsStatus();
+    }finally{this.modelChange=false;}
+  });}
   lifecycle(action) {
     const work = (this.lifecycleTail || Promise.resolve()).catch(() => {}).then(action);
     this.lifecycleTail = work;
     return work;
   }
-  createSession(options = {}) { return this.lifecycle(() => this.openSession(options)); }
+  createSession(options = {}) { if(this.modelsInitializing)return Promise.reject(new Error('RVM modelleri kontrol ediliyor.'));if(this.modelChange)return Promise.reject(new Error('RVM modeli değiştiriliyor; işlem tamamlandıktan sonra tekrar deneyin.'));return this.lifecycle(() => this.openSession(options)); }
   async openSession(options) {
+    if(this.modelChange)throw Error('RVM modeli değiştiriliyor; işlem tamamlandıktan sonra tekrar deneyin.');
     const policy = options.subjectSelection === undefined ? null : normalizeSubjectPolicy(options.subjectSelection);
     if (this.subjectOwner) throw new Error("A subject selection session already owns the pipeline");
     if (policy && this.sessions.size) throw new Error("Close existing RVM sessions before selecting subjects");
@@ -358,11 +391,12 @@ class RvmService {
     if (!existed) return false;
     if (this.subjectOwner === id) { this.subjectOwner = null; this.subjectLock = null; }
     for (const subscriber of this.subscribers) if (subscriber.sessionId === id) subscriber.socket.destroy();
-    if (!this.sessions.size) await this.resetPipeline();
+    if (!this.sessions.size) { await this.resetPipeline(); if(this.preview.active&&!this.stopping) { await this.ensureWorker(); await this.ensureCameraSource(); } }
     return true;
   }
   resetPipeline() {
     if (this.resetPromise) return this.resetPromise;
+    this.preview.clear();
     const cameraSocket = this.cameraSocket, sourceSession = this.sourceSession;
     this.cameraSocket = null; this.sourceSession = null; cameraSocket?.destroy(); this.latestSourceFrame = null;
     const work = (async () => {
@@ -396,6 +430,7 @@ class RvmService {
     return work.finally(() => { if (this.stillTask === work) this.stillTask = null; });
   }
   async performStillMatte(cameraArtifact) {
+    if(this.models&&cameraArtifact.width*cameraArtifact.height>this.models.limits().maxNativePixels)throw Error('Seçili modelin fotoğraf çözünürlüğü sınırı aşıldı. Varsayılan MobileNetV3 FP32 modeline dönün.');
     const startedAt = performance.now();
     this.stillCaptureBusy = true;
     this.latestSourceFrame = null;
@@ -418,15 +453,15 @@ class RvmService {
       }
     if (this.subjectOwner && (!mask.subjectState?.verifiedNative || mask.subjectState.lockId !== this.subjectLock)) throw new Error("Native subject verification is missing");
     let foregroundArtifact;
-    if (mask.codec === 5) {
-      const maskLength = mask.payload.readUInt32BE(0);
-      if (maskLength !== mask.width * mask.height || mask.payload.length <= 4 + maskLength) throw new Error("Invalid native foreground response");
-      const payload = mask.payload.subarray(4 + maskLength);
+    if (mask.foregroundPayload || mask.codec === 5) {
+      const maskLength = mask.foregroundPayload ? mask.payload.length : mask.payload.readUInt32BE(0);
+      if (maskLength !== mask.width * mask.height || (!mask.foregroundPayload&&mask.payload.length <= 4 + maskLength)) throw new Error("Invalid native foreground response");
+      const payload = mask.foregroundPayload || mask.payload.subarray(4 + maskLength);
       const id = crypto.randomUUID(), exp = Math.floor(Date.now() / 1000) + 120;
       foregroundArtifact = { id, width: mask.width, height: mask.height, byteLength: payload.length, mimeType: "image/jpeg", expiresAt: new Date(exp * 1000).toISOString(), readCapability: signCapability({ aud: "rvm", scope: "artifact:read", artifact: id, exp }, this.capabilitySecret) };
       this.artifacts.set(id, { ...foregroundArtifact, payload });
       setTimeout(() => this.artifacts.delete(id), 125_000).unref?.();
-      mask = { ...mask, codec: Codec.GRAY8, payload: mask.payload.subarray(4, 4 + maskLength) };
+      mask = { ...mask, codec: Codec.GRAY8, payload: mask.foregroundPayload?mask.payload:mask.payload.subarray(4, 4 + maskLength),foregroundPayload:undefined };
     }
     if (mask.payload.length !== mask.width * mask.height) throw new Error("Invalid native mask length");
     const timings = { sourceReadMs: Math.round(sourceReadMs), queueMs: Math.round(queueMs), workerAndDecodeMs: Math.round(performance.now() - queueStartedAt - queueMs), totalMs: Math.round(performance.now() - startedAt), inputBytes: source.payload.length, maskBytes: mask.payload.length, foregroundBytes: foregroundArtifact?.byteLength || 0, serviceRssBytes: process.memoryUsage().rss };
@@ -440,8 +475,23 @@ class RvmService {
   async handleControl(req, res) {
     const url = new URL(req.url, "http://local");
     try {
-      if (req.method === "GET" && url.pathname === "/v1/health") return json(res, 200, { ...this.health(), subjectSelection: this.subjectModelReady ? { version: 1, modes: ["area", "tracking", "all"], nativeVerification: true, occlusionGuard: true } : null });
-      if (!this.authorized(req)) return json(res, 401, { error: "Unauthorized" });
+      if (req.method === "GET" && url.pathname === "/v1/health") return json(res, 200, { ...this.health(), ...(this.modelChange?{status:'starting',errorCode:'RVM_MODEL_SWITCHING',error:'RVM modeli değiştiriliyor.'}:{}), model:this.models?{id:this.loadedModelId||this.models.active.id,...this.models.limits(this.loadedModelId||this.models.active.id)}:null, subjectSelection: this.subjectModelReady ? { version: 1, modes: ["area", "tracking", "all"], nativeVerification: true, occlusionGuard: true } : null });
+      if (!this.authorized(req)&&!this.authorized(req,'admin')) return json(res, 401, { error: "Unauthorized" });
+      if(req.method==='POST'&&url.pathname==='/v1/preview/start')return json(res,200,await this.preview.start());
+      const previewMatch=url.pathname.match(/^\/v1\/preview\/([a-f0-9-]{36})(\/stop)?$/);
+      if(previewMatch&&req.method==='POST'&&previewMatch[2])return json(res,200,await this.preview.stop(previewMatch[1]));
+      if(previewMatch&&req.method==='GET'&&!previewMatch[2]){
+        const packet=this.preview.read(previewMatch[1]);
+        if(!packet){res.writeHead(204,{'cache-control':'no-store'});return res.end();}
+        res.writeHead(200,{'content-type':'application/x-navbea-preview','content-length':packet.length,'cache-control':'no-store'});return res.end(packet);
+      }
+      if(req.method==='GET'&&url.pathname==='/v1/models')return json(res,200,this.modelsStatus());
+      if(req.method==='POST'&&['/v1/models/download','/v1/models/cancel','/v1/models/activate'].includes(url.pathname)){
+        if(!this.authorized(req,'admin'))return json(res,403,{error:'Model yönetimi için yönetici izni gerekiyor.'});
+        if(!this.models||this.modelsInitializing)throw Error('Model yönetimi hazır değil.');
+        const body=await readJson(req);
+        return json(res,200,url.pathname.endsWith('/download')?this.models.startDownload(body.id):url.pathname.endsWith('/cancel')?this.models.cancelDownload():await this.changeModel(body.id));
+      }
       if (req.method === "GET" && url.pathname === "/v1/capabilities") return json(res, 200, { apiVersion: API_VERSION, input: { profile: "matting-720p24", codec: "mjpeg", minimumFps: 24 }, output: { codec: "gray8", sequenceAligned: true, maximumLagMs: 150 }, nativeStill: true });
       if (req.method === "POST" && url.pathname === "/v1/sessions") return json(res, 201, await this.createSession(await readJson(req)));
       const sessionMatch = url.pathname.match(/^\/v1\/sessions\/([a-f0-9-]+)$/);
@@ -487,12 +537,18 @@ class RvmService {
       await this.ensureStorage();
       this.controlServer = http.createServer((req, res) => void this.handleControl(req, res)); this.streamServer = net.createServer(socket => this.handleStream(socket));
       await this.listen(this.controlServer, this.paths.control); await this.listen(this.streamServer, this.paths.stream);
-      await this.startWorker().catch(error => this.scheduleWorkerRestart(error));
+      this.modelsInitializing=true;
+      try {
+      if(!this.fixture){const options=this.workerOptions();this.models=new ModelManager({dataRoot:this.dataRoot,bundledRoot:path.dirname(options.model),probe:(model,device)=>runModelProbe(this.workerOptions(),model,device,this.modelAbort.signal)});try{await this.models.initialize();}catch(error){this.modelManagerError=error.message;this.models=null;}}
+      }finally{this.modelsInitializing=false;}
+      await this.startWorker().catch(async error => {if(this.models&&this.models.active.id!==this.models.catalogue.defaultModel){await this.models.restore({id:this.models.catalogue.defaultModel,device:'cpu'},'Seçilen model başlatılamadı; varsayılan modele dönüldü.');this.workerProfile=null;await this.startWorker().catch(error=>this.scheduleWorkerRestart(error));}else this.scheduleWorkerRestart(error);});
       return this;
     } catch (error) { await this.stop(); throw error; }
   }
   async stop() {
+    this.preview.dispose();
     this.stopping = true; if (this.workerRestartTimer) clearTimeout(this.workerRestartTimer);
+    this.modelAbort.abort();this.models?.cancelDownload();await this.models?.downloadPromise;
     clearTimeout(this.idleTimer);
     const source = this.sourceSession, socket = this.cameraSocket;
     this.sourceSession = null; this.cameraSocket = null; socket?.destroy(); this.worker?.stop();

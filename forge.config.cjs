@@ -5,6 +5,7 @@ module.exports = {
   outDir: process.env.NAVBEA_RVM_FORGE_OUT || "out",
   packagerConfig: {
     asar: true, name: "Navbea RVM", executableName: "navbea-rvm",
+    ignore:relative=>{const name=relative.replaceAll('\\','/');if(/(^|\/)(tests?|__tests__|\.superdesign)(\/|$)|\.(test|spec)\./i.test(name))return true;if(/^\/node_modules(\/|$)/.test(name))return false;return !(!name||name==='/'||/^\/(dist|electron)(\/|$)/.test(name)||/^\/package(?:-lock)?\.json$/.test(name));},
     extraResource: ["service", "worker", "models", "deploy", "local-media-protocol", "THIRD_PARTY_LICENSES", "LICENSE", "THIRD_PARTY_NOTICES.md", "SOURCE_OFFER.md", "CHANGES.md", "SBOM.spdx.json", modelSource].filter(Boolean),
   },
   hooks: { postPackage: async (_config, result) => {

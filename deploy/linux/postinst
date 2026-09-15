@@ -9,6 +9,7 @@ usermod -g navbea-media navbea-rvm
 install -d -o navbea-rvm -g navbea-media -m 0755 /var/lib/navbea/rvm
 install -d -o root -g navbea-media -m 0755 /run/navbea
 resources=/usr/lib/navbea-rvm/resources
+chmod 0755 "$resources/deploy/linux/model-admin"
 runuser -u navbea-rvm -- "$resources/runtime/bin/python" -I -B "$resources/worker/rvm_worker.py" --model "$resources/models/rvm_mobilenetv3_fp32.onnx" --device cpu --threads 1 --check-runtime
 install -m 0644 "$resources/deploy/linux/navbea-rvm.service" /lib/systemd/system/navbea-rvm.service
 systemctl daemon-reload

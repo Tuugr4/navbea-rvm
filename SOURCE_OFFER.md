@@ -1,11 +1,9 @@
-# Corresponding source — Navbea RVM 1.0.4
+# Corresponding source — Navbea RVM 1.1.1-local
 
 Navbea RVM is distributed under GNU GPL version 3. The complete corresponding
-source for version 1.0.4 is available at no charge in both of these locations:
-
-1. The installed package under `resources/source/`.
-2. The public `v1.0.4` release at
-   https://github.com/Tuugr4/navbea-rvm/releases/tag/v1.0.4
+source for this local build is included at no charge in the installed package
+under `resources/source/navbea-rvm-1.1.1-local-corresponding-source.zip`.
+This working-tree build does not claim a published release tag.
 
 The corresponding-source archive identifies the exact Navbea source commit and
 contains build/install scripts, dependency lockfiles, the local-media protocol,

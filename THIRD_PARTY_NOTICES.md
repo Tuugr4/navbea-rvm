@@ -1,6 +1,6 @@
 # Third-party notices
 
-Navbea RVM 1.0.4 is distributed under GPL-3.0-only. The following components
+Navbea RVM 1.1.1-local is distributed under GPL-3.0-only. The following components
 are included in source or binary distributions. Exact package versions are
 also recorded in `SBOM.spdx.json`.
 
@@ -15,6 +15,11 @@ and Soumyadip Sengupta and is distributed under GPL-3.0.
 - Model SHA-256: `88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828`
 - Full license: `LICENSE`
 - Changes made around the model: `CHANGES.md`
+
+The optional MobileNetV3 FP16 and ResNet50 FP16/FP32 ONNX models are downloaded
+only on request from the same official v1.0.0 release. Their exact sizes and
+SHA-256 checksums are recorded in `models/catalog.json`. These unmodified models
+are also GPL-3.0; they are not included in the default installer payload.
 
 ## Bundled diagnostics UI
 

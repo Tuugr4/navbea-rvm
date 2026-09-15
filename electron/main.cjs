@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell } = require("electron");
+const { app, BrowserWindow, ipcMain, shell, screen } = require("electron");
 const fs = require("node:fs/promises");
 const http = require("node:http");
 const path = require("node:path");
@@ -7,13 +7,17 @@ const path = require("node:path");
 // inherited stdout/stderr pipe is not an application failure.
 for (const output of [process.stdout, process.stderr]) output?.on?.("error", () => undefined);
 function loadProtocol() {
-  const candidates = [process.env.NAVBEA_PROTOCOL_PATH, app.isPackaged ? path.join(process.resourcesPath, "local-media-protocol", "index.cjs") : null, path.resolve(__dirname, "..", "local-media-protocol", "index.cjs")].filter(Boolean);
+  const candidates = [!app.isPackaged ? process.env.NAVBEA_PROTOCOL_PATH : null, app.isPackaged ? path.join(process.resourcesPath, "local-media-protocol", "index.cjs") : null, path.resolve(__dirname, "..", "local-media-protocol", "index.cjs")].filter(Boolean);
   for (const candidate of candidates) try { return require(candidate); } catch { /* next */ }
   throw new Error("Local media protocol is missing");
 }
 const { endpointPaths } = loadProtocol();
 const serviceMode = process.argv.includes("--service");
-if (serviceMode) {
+const modelAdmin=process.argv.includes('--model-admin');
+if(modelAdmin){
+  const [action,id]=process.argv.slice(process.argv.indexOf('--model-admin')+1);const controller=require('./model-control.cjs');
+  Promise.resolve().then(()=>{if(!app.isPackaged||process.platform!=='win32')throw Error('Installed Windows application required');controller.check(action,id);return controller.request({dataRoot:path.join(process.env.PROGRAMDATA||'C:\\ProgramData','Navbea','RVM'),control:endpointPaths('rvm','win32',{}).control,role:'admin'},'/v1/models/'+action,{id});}).then(()=>app.exit(0),error=>{console.error(error.message);app.exit(1);});
+} else if (serviceMode) {
   const machineRoot = process.env.PROGRAMDATA || "C:\\ProgramData";
   process.env.NAVBEA_PROTOCOL_PATH ||= path.join(process.resourcesPath, "local-media-protocol", "index.cjs");
   process.env.NAVBEA_RVM_ROOT ||= process.resourcesPath;
@@ -30,15 +34,24 @@ if (serviceMode) {
 } else {
 if (process.platform === "win32") app.setAppUserModelId("com.navbea.RVM");
 app.setPath("userData", path.join(app.getPath("appData"), "Navbea", "RVM"));
-function root() { return process.env.NAVBEA_RVM_DATA_DIR || (process.platform === "win32" ? path.join(process.env.PROGRAMDATA || "C:\\ProgramData", "Navbea", "RVM") : "/var/lib/navbea/rvm"); }
+function root() { return (!app.isPackaged&&process.env.NAVBEA_RVM_DATA_DIR) || (process.platform === "win32" ? path.join(process.env.PROGRAMDATA || "C:\\ProgramData", "Navbea", "RVM") : "/var/lib/navbea/rvm"); }
 function resource(name) { return app.isPackaged ? path.join(process.resourcesPath, name) : path.join(__dirname, "..", name); }
-async function health() {
-  const token = (await fs.readFile(path.join(root(), "client-token.txt"), "utf8")).trim();
-  return new Promise((resolve, reject) => { const req = http.request({ socketPath: endpointPaths("rvm", process.platform, process.env).control, method: "GET", path: "/v1/health", headers: { "x-navbea-client-token": token } }, res => { const chunks = []; res.on("data", chunk => chunks.push(chunk)); res.on("end", () => resolve(JSON.parse(Buffer.concat(chunks).toString()))); }); req.on("error", reject); req.end(); });
-}
-function createWindow() { const win = new BrowserWindow({ width: 1100, height: 760, minWidth: 860, minHeight: 600, show: false, backgroundColor: "#061426", autoHideMenuBar: true, webPreferences: { preload: path.join(__dirname, "preload.cjs"), nodeIntegration: false, contextIsolation: true, sandbox: true } }); win.once("ready-to-show", () => win.show()); if (process.env.VITE_DEV_SERVER_URL) win.loadURL(process.env.VITE_DEV_SERVER_URL); else win.loadFile(path.join(__dirname, "..", "dist", "index.html")); }
+async function health() { return modelController.request(modelOptions(),'/v1/health'); }
+let modelWindow;
+function createWindow() { const win = new BrowserWindow({ ...require("./window-layout.cjs").windowBoundsForWorkArea(screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea), show: false, backgroundColor: "#f4f4f2", autoHideMenuBar: true, webPreferences: { preload: path.join(__dirname, "preload.cjs"), nodeIntegration: false, contextIsolation: true, sandbox: true } }); modelWindow=win;win.webContents.setWindowOpenHandler(()=>({action:'deny'}));win.webContents.on('will-navigate',event=>event.preventDefault());win.once("ready-to-show", () => win.show()); if (process.env.VITE_DEV_SERVER_URL) win.loadURL(process.env.VITE_DEV_SERVER_URL); else win.loadFile(path.join(__dirname, "..", "dist", "index.html")); }
 app.whenReady().then(createWindow); app.on("window-all-closed", () => app.quit());
 ipcMain.handle("rvm:health", health);
+const modelController=require('./model-control.cjs');
+const modelOptions=()=>({dataRoot:root(),control:endpointPaths('rvm',process.platform,process.env).control,platform:process.platform,executable:process.execPath,systemRoot:process.env.SystemRoot||'C:\\Windows'});
+const previewClient=new (require('./preview-client.cjs').PreviewClient)(modelOptions());
+app.on('browser-window-created',(_event,win)=>win.once('closed',()=>void previewClient.stop().catch(()=>{})));
+function requireModelWindow(event){if(!modelWindow||modelWindow.isDestroyed()||event.sender!==modelWindow.webContents||event.senderFrame!==event.sender.mainFrame)throw Error('Model yönetimi yalnız RVM penceresinden yapılabilir.');}
+ipcMain.handle('rvm:models',event=>{requireModelWindow(event);return modelController.request(modelOptions(),'/v1/models');});
+ipcMain.handle('rvm:preview-start',event=>{requireModelWindow(event);return previewClient.start();});
+ipcMain.handle('rvm:preview-frame',event=>{requireModelWindow(event);return previewClient.frame();});
+ipcMain.handle('rvm:preview-stop',event=>{requireModelWindow(event);return previewClient.stop();});
+let modelAction=null;
+ipcMain.handle('rvm:model-action',(event,action,id)=>{requireModelWindow(event);modelController.check(action,id);if(modelAction)throw Error('Model işlemi sürüyor.');modelAction=modelController.administer(modelOptions(),action,id).finally(()=>{modelAction=null;});return modelAction;});
 ipcMain.handle("rvm:open-source", () => app.getVersion().includes("-local") && app.isPackaged ? shell.openPath(resource("source")) : shell.openExternal("https://github.com/Tuugr4/navbea-rvm/releases/tag/v1.0.4"));
 ipcMain.handle("rvm:open-upstream", () => shell.openExternal("https://github.com/PeterL1n/RobustVideoMatting"));
 ipcMain.handle("rvm:open-license", () => shell.openPath(resource("LICENSE")));

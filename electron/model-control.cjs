@@ -1,0 +1,1 @@
+const path=require("node:path"),fs=require("node:fs"); const packaged=path.join(__dirname,"../../service/model-control-client.cjs"); module.exports=require(fs.existsSync(packaged)?packaged:path.join(__dirname,"../service/model-control-client.cjs"));

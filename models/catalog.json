@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "defaultModel": "mobilenetv3-fp32",
+  "upstream": "https://github.com/PeterL1n/RobustVideoMatting/releases/tag/v1.0.0",
+  "license": "GPL-3.0-only",
+  "models": [
+    {"id":"mobilenetv3-fp32","name":"MobileNetV3 FP32","architecture":"mobilenetv3","precision":"fp32","file":"rvm_mobilenetv3_fp32.onnx","bytes":14975696,"sha256":"88d4531297118f595bf2fd60f6f566aec2e559393802d1f436c380f0cbbd2828","bundled":true,"recommendedMemoryGiB":8},
+    {"id":"mobilenetv3-fp16","name":"MobileNetV3 FP16","architecture":"mobilenetv3","precision":"fp16","file":"rvm_mobilenetv3_fp16.onnx","bytes":7503483,"sha256":"6a0d5ce6cc17702613be548559879b4521ed424cfe14ddc48d1acaa44d616f64","recommendedMemoryGiB":8},
+    {"id":"resnet50-fp32","name":"ResNet50 FP32","architecture":"resnet50","precision":"fp32","file":"rvm_resnet50_fp32.onnx","bytes":107479165,"sha256":"25db300fcb6ee27f941a1b52c97856e8d1f13c7f35817f81a612f89af0e8a85c","recommendedMemoryGiB":16},
+    {"id":"resnet50-fp16","name":"ResNet50 FP16","architecture":"resnet50","precision":"fp16","file":"rvm_resnet50_fp16.onnx","bytes":53752431,"sha256":"a9266f5046411d604bbff38e18c54bf8c70d85d93bbc400564697590f5712738","recommendedMemoryGiB":16}
+  ]
+}
