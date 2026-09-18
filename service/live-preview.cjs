@@ -15,9 +15,7 @@ class LivePreview {
       const s = this.service;
       if (s.stopping || s.modelChange || s.modelsInitializing) throw Error('RVM hazırlanıyor. Biraz sonra tekrar deneyin.');
       if (this.leases.size >= 2) throw Error('Açık RVM önizlemesini önce kapatın.');
-      clearTimeout(s.idleTimer);
-      await s.ensureWorker();
-      await s.ensureCameraSource();
+      await s.preparePipeline();
       const lease = crypto.randomUUID(); this.leases.set(lease, this.now() + 6000);
       return { lease };
     });

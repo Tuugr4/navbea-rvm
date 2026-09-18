@@ -22,7 +22,7 @@ function loadProtocol() {
 }
 const { Codec, FrameDecoder, MessageType, encodeFrame, endpointPaths, signCapability, verifyCapability, normalizeSubjectPolicy } = loadProtocol();
 
-const VERSION = "1.1.1-local";
+const VERSION = "1.1.4-local";
 const API_VERSION = "1.1";
 const MAX_CONTROL_BODY = 64 * 1024;
 
@@ -234,20 +234,21 @@ class RvmService {
     this.worker = new PythonWorker(options);
     const worker = this.worker;
     worker.onProvider=(provider,reason)=>{if(this.worker!==worker)return;this.metrics.device=provider;this.metrics.providerFallback=reason||null;};
-    worker.onMask = frame => this.acceptMask(frame);
-    worker.onFailure = error => { this.status = "unavailable"; this.errorCode = "RVM_WORKER_PIPE_FAILED"; this.error = error.message; };
+    worker.onMask = frame => { if (this.worker === worker) this.acceptMask(frame); };
+    worker.onFailure = error => { if (this.worker !== worker) return; this.workerFailure = error; this.status = "unavailable"; this.errorCode = "RVM_WORKER_PIPE_FAILED"; this.error = error.message; };
     const startedAt = Date.now();
     worker.onExit = code => { if (this.worker !== worker) return; if (Date.now() - startedAt > 120_000) this.workerRestarts = 0; this.worker = null; this.scheduleWorkerRestart(new Error(`RVM worker exited (${code})`)); };
     try { await worker.start(); }
     catch (error) { worker.stop(); if (this.worker === worker) this.worker = null; throw error; }
     if (this.stopping) { worker.stop(); this.worker = null; return; }
     this.loadedModelId=this.models?.active.id;
+    this.workerFailure = null;
     this.status = "ready"; this.errorCode = null; this.error = null;
   }
   cameraRequest(method, pathname, body, authorization) {
     const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
     return new Promise((resolve, reject) => {
-      const req = http.request({ socketPath: this.cameraPaths.control, method, path: pathname, timeout: 15_000, headers: { "x-navbea-client-token": this.cameraClientToken, ...(authorization ? { authorization } : {}), ...(payload ? { "content-type": "application/json", "content-length": payload.length } : {}) } }, res => {
+      const req = http.request({ socketPath: this.cameraPaths.control, method, path: pathname, timeout: method === "POST" && pathname === "/v1/sessions" ? 60_000 : 15_000, headers: { "x-navbea-client-token": this.cameraClientToken, ...(authorization ? { authorization } : {}), ...(payload ? { "content-type": "application/json", "content-length": payload.length } : {}) } }, res => {
         const chunks = []; let length = 0;
         const limit = pathname.startsWith("/v1/artifacts/") ? 64 * 1024 * 1024 : 1024 * 1024;
         res.on("data", chunk => { length += chunk.length; if (length > limit) req.destroy(new Error("Camera response exceeds its size limit")); else chunks.push(chunk); });
@@ -266,35 +267,47 @@ class RvmService {
   async openCameraSource() {
     const healthResponse = await this.cameraRequest("GET", "/v1/health");
     const cameraHealth = JSON.parse(healthResponse.data.toString());
-    if (cameraHealth.status !== "ready" || String(cameraHealth.apiVersion || "").split(".")[0] !== "1") throw new Error(`Camera Service is incompatible or unavailable (${cameraHealth.apiVersion || "unknown"})`);
+    const retryable = cameraHealth.status === "unavailable" && cameraHealth.readiness?.canRetryOpenSession === true && cameraHealth.readiness?.cameraValidated === true;
+    if ((cameraHealth.status !== "ready" && !retryable) || String(cameraHealth.apiVersion || "").split(".")[0] !== "1") throw new Error(`Camera Service is incompatible or unavailable (${cameraHealth.apiVersion || "unknown"})`);
     const response = await this.cameraRequest("POST", "/v1/sessions", { profile: "matting-720p24" });
     this.sourceSession = JSON.parse(response.data.toString());
     if (this.stopping) { const id = this.sourceSession.id; this.sourceSession = null; await this.cameraRequest("DELETE", `/v1/sessions/${id}`).catch(() => undefined); throw new Error("RVM service is stopping"); }
+    const sourceSession = this.sourceSession;
     const decoder = new FrameDecoder(); let acknowledged = false; let preamble = Buffer.alloc(0);
     const socket = net.createConnection(this.cameraPaths.stream);
     this.cameraSocket = socket;
-    socket.once("connect", () => { if (!socket.destroyed) socket.write(`${JSON.stringify({ sessionId: this.sourceSession.id, capability: this.sourceSession.capability })}\n`, error => { if (error && this.cameraSocket === socket) { this.error = error.message; this.status = "unavailable"; this.errorCode = "CAMERA_STREAM_FAILED"; } }); });
+    let resolveReady, rejectReady, readySettled = false;
+    const readiness = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+    const settleReady = error => {
+      if (readySettled) return;
+      readySettled = true; clearTimeout(readyTimer);
+      if (error) rejectReady(error); else resolveReady();
+    };
+    const readyTimer = setTimeout(() => socket.destroy(new Error("Camera stream handshake timed out")), 10_000);
+    socket.once("connect", () => { if (!socket.destroyed) socket.write(`${JSON.stringify({ sessionId: sourceSession.id, capability: sourceSession.capability })}\n`, error => { if (error && this.cameraSocket === socket) { this.error = error.message; this.status = "unavailable"; this.errorCode = "CAMERA_STREAM_FAILED"; } }); });
     socket.on("data", chunk => {
       try {
-      if (!acknowledged) { preamble = Buffer.concat([preamble, chunk]); const end = preamble.indexOf(10); if (end < 0) { if (preamble.length > 8192) throw new Error("Camera handshake is too large"); return; } if (end > 8192 || JSON.parse(preamble.subarray(0, end)).status !== "ready") throw new Error("Invalid Camera stream handshake"); acknowledged = true; chunk = preamble.subarray(end + 1); preamble = Buffer.alloc(0); }
+      if (!acknowledged) { preamble = Buffer.concat([preamble, chunk]); const end = preamble.indexOf(10); if (end < 0) { if (preamble.length > 8192) throw new Error("Camera handshake is too large"); return; } if (end > 8192 || JSON.parse(preamble.subarray(0, end)).status !== "ready") throw new Error("Invalid Camera stream handshake"); acknowledged = true; settleReady(); chunk = preamble.subarray(end + 1); preamble = Buffer.alloc(0); }
       if (!chunk.length) return;
       for (const frame of decoder.push(chunk)) void this.processSourceFrame(frame);
       } catch (error) { socket.destroy(error); }
     });
     socket.on("close", () => {
+      settleReady(new Error("Camera stream closed before readiness"));
       if (this.cameraSocket !== socket) return;
       const source = this.sourceSession;
       this.cameraSocket = null; this.sourceSession = null; this.status = "unavailable"; this.errorCode = "CAMERA_STREAM_LOST";
       if (source) void this.cameraRequest("DELETE", `/v1/sessions/${source.id}`).catch(() => undefined);
     });
-    socket.on("error", error => { if (this.cameraSocket !== socket) return; this.error = error.message; this.status = "unavailable"; this.errorCode = "CAMERA_STREAM_FAILED"; });
+    socket.on("error", error => { settleReady(error); if (this.cameraSocket !== socket) return; this.error = error.message; this.status = "unavailable"; this.errorCode = "CAMERA_STREAM_FAILED"; });
+    await readiness;
   }
   async processSourceFrame(frame) {
     if (frame.type !== MessageType.FRAME || ![Codec.MJPEG, Codec.JPEG].includes(frame.codec)) return;
     if (frame.monotonicNs && Number(process.hrtime.bigint() - frame.monotonicNs) / 1e6 > 500) { this.metrics.dropped++; return; }
     // Admit only one live inference. A second queued frame adds a full CPU
     // inference interval to mask latency without increasing throughput.
-    if (this.stillCaptureBusy || this.resetPromise || !this.cameraSocket) { this.metrics.dropped += 1; return; }
+    if (this.stillCaptureBusy || this.resetPromise || this.pipelinePreparing || !this.cameraSocket) { this.metrics.dropped += 1; return; }
     if (this.sequenceTimes.size >= 1) { if (this.latestSourceFrame) this.metrics.dropped += 1; this.latestSourceFrame = frame; return; }
     const started = process.hrtime.bigint(); this.sequenceTimes.set(frame.sequence.toString(), started);
     this.preview.offerSource(frame);
@@ -308,7 +321,7 @@ class RvmService {
   }
   acceptMask(frame) {
     const key = frame.sequence.toString(); const started = this.sequenceTimes.get(key); this.sequenceTimes.delete(key);
-    if (this.resetPromise || this.stopping) return;
+    if (this.resetPromise || this.pipelinePreparing || this.stopping || this.workerFailure) return;
     this.preview.acceptMask(frame);
     if (started) this.metrics.inferenceMs = Number(process.hrtime.bigint() - started) / 1e6;
     this.metrics.frames += 1; this.status = "ready"; this.errorCode = null; this.error = null;
@@ -322,7 +335,13 @@ class RvmService {
     const encoded = frame.subjectState ? Buffer.concat([encodeFrame({ type: MessageType.SUBJECT_STATE, codec: Codec.JSON, streamId: subscriber.streamId, sequence: frame.sequence, monotonicNs: frame.monotonicNs, payload: Buffer.from(JSON.stringify(frame.subjectState)) }), mask]) : mask;
     writeLatestBounded(subscriber, encoded, () => { this.metrics.dropped += 1; });
   }
-  health() { return { status: this.status, service: "rvm", sourceTimestamps: "camera-monotonic", version: VERSION, build: buildInfo, apiVersion: API_VERSION, uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000), errorCode: this.errorCode, error: this.error, sourceSession: this.sourceSession?.id || null, workerState: this.worker ? (this.stillCaptureBusy ? "native" : this.resetPromise ? "resetting" : "warm") : this.fixture ? "fixture" : "idle", modelSha256: this.workerProfile?.modelHash || null, metrics: { frames: this.metrics.frames, dropped: this.metrics.dropped, maskFps: this.metrics.maskFps, inferenceMs: this.metrics.inferenceMs === null ? null : Number(this.metrics.inferenceMs.toFixed(2)), device: this.metrics.device, threads: this.metrics.threads ?? null, threadMode: this.metrics.threadMode ?? null, availableProcessors: this.metrics.availableProcessors ?? null, physicalCores: this.metrics.physicalCores ?? null, cpuBudget: this.workerProfile?.budget ?? null, stillThreads: this.metrics.stillThreads ?? null, stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), stillRatio: Number(this.env.RVM_STILL_RATIO || .5), lastStill: this.metrics.lastStill || null } }; }
+  canRetryOpenSession() {
+    return Boolean(this.status === "unavailable" && ["CAMERA_STREAM_LOST", "CAMERA_STREAM_FAILED"].includes(this.errorCode)
+      && this.worker && !this.workerFailure && this.subjectModelReady && !this.fixture && !this.modelManagerError
+      && !this.stopping && !this.modelChange && !this.modelsInitializing && !this.pipelinePreparing && !this.resetPromise
+      && !this.stillTask && !this.workerStartPromise && !this.sourceStartPromise && !this.sessions.size && !this.subjectOwner);
+  }
+  health() { return { status: this.status, readiness: { canRetryOpenSession: this.canRetryOpenSession() }, service: "rvm", sourceTimestamps: "camera-monotonic", version: VERSION, build: buildInfo, apiVersion: API_VERSION, uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000), errorCode: this.errorCode, error: this.error, sourceSession: this.sourceSession?.id || null, workerState: this.worker ? (this.stillCaptureBusy ? "native" : this.resetPromise ? "resetting" : "warm") : this.fixture ? "fixture" : "idle", modelSha256: this.workerProfile?.modelHash || null, metrics: { frames: this.metrics.frames, dropped: this.metrics.dropped, maskFps: this.metrics.maskFps, inferenceMs: this.metrics.inferenceMs === null ? null : Number(this.metrics.inferenceMs.toFixed(2)), device: this.metrics.device, threads: this.metrics.threads ?? null, threadMode: this.metrics.threadMode ?? null, availableProcessors: this.metrics.availableProcessors ?? null, physicalCores: this.metrics.physicalCores ?? null, cpuBudget: this.workerProfile?.budget ?? null, stillThreads: this.metrics.stillThreads ?? null, stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), stillRatio: Number(this.env.RVM_STILL_RATIO || .5), lastStill: this.metrics.lastStill || null, lastStartup: this.metrics.lastStartup || null } }; }
   authorized(req,role='client') { const a = Buffer.from(String(req.headers[role==='admin'?'x-navbea-admin-token':"x-navbea-client-token"] || "")); const secret=role==='admin'?this.adminSecret:this.clientSecret; if(!secret)return false;const b = Buffer.from(String(secret)); return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b); }
   modelsStatus(){if(this.modelsInitializing)return{available:false,error:'Modeller kontrol ediliyor.'};if(!this.models)return{available:false,error:'Model yönetimi henüz hazır değil.'};const status=this.models.snapshot();const activeId=this.loadedModelId||status.active.id;return {...status,available:true,active:{...status.active,id:activeId},models:status.models.map(item=>({...item,active:item.id===activeId})),switching:Boolean(this.modelChange)||status.switching,activeSessions:this.sessions.size,actualProvider:this.metrics.device};}
   changeModel(id){return this.lifecycle(async()=>{
@@ -347,23 +366,66 @@ class RvmService {
     return work;
   }
   createSession(options = {}) { if(this.modelsInitializing)return Promise.reject(new Error('RVM modelleri kontrol ediliyor.'));if(this.modelChange)return Promise.reject(new Error('RVM modeli değiştiriliyor; işlem tamamlandıktan sonra tekrar deneyin.'));return this.lifecycle(() => this.openSession(options)); }
+  async preparePipeline({ policy = null, resetState = false } = {}) {
+    if (this.stopping) throw new Error("RVM service is stopping");
+    clearTimeout(this.idleTimer);
+    if (this.resetPromise) await this.resetPromise;
+    const startedAt = performance.now();
+    const timings = { workerMs: 0, cameraMs: 0, resetMs: 0 };
+    // Both resources are requested only by an active viewer/session. Do not
+    // queue live frames in a worker that is still loading or resetting state.
+    this.pipelinePreparing = true;
+    if (resetState) this.preview.clear();
+    try {
+      const results = await Promise.allSettled([
+        (async () => {
+          const workerStartedAt = performance.now();
+          await this.ensureWorker();
+          timings.workerMs = Math.round(performance.now() - workerStartedAt);
+          if (policy && (!this.subjectModelReady || this.fixture)) throw new Error("Subject instance model is unavailable");
+          if (this.stopping) throw new Error("RVM service is stopping");
+          if (resetState && !this.fixture && this.worker) {
+            const resetStartedAt = performance.now();
+            if (this.stillTask) await this.stillTask.catch(() => undefined);
+            await this.worker.reset();
+            this.sequenceTimes.clear(); this.latestSourceFrame = null;
+            timings.resetMs = Math.round(performance.now() - resetStartedAt);
+          }
+        })(),
+        (async () => {
+          const cameraStartedAt = performance.now();
+          await this.ensureCameraSource();
+          timings.cameraMs = Math.round(performance.now() - cameraStartedAt);
+        })(),
+      ]);
+      const failure = results.find(result => result.status === "rejected");
+      if (failure) throw failure.reason;
+      if (this.stopping) throw new Error("RVM service is stopping");
+      if (!this.sourceSession) throw new Error("Camera stream disconnected during RVM startup");
+      // A warm model does not emit another ready event after only its Camera
+      // stream was lost. The fresh source handshake above proves that side is
+      // usable again; never use it to clear an independent worker failure.
+      if ((this.worker || this.fixture) && !this.workerFailure && ["CAMERA_STREAM_LOST", "CAMERA_STREAM_FAILED"].includes(this.errorCode)) {
+        this.status = "ready"; this.errorCode = null; this.error = null;
+      }
+      if (this.workerFailure || this.status !== "ready") throw new Error("RVM is not ready");
+      this.metrics.lastStartup = { ...timings, totalMs: Math.round(performance.now() - startedAt) };
+    } catch (error) {
+      // Wait for both branches above before releasing partial ownership. A
+      // late Camera session must not survive a failed model initialization.
+      if (!this.sessions.size && !this.preview.active) await this.resetPipeline().catch(() => undefined);
+      throw error;
+    } finally {
+      this.pipelinePreparing = false;
+    }
+  }
   async openSession(options) {
     if(this.modelChange)throw Error('RVM modeli değiştiriliyor; işlem tamamlandıktan sonra tekrar deneyin.');
     const policy = options.subjectSelection === undefined ? null : normalizeSubjectPolicy(options.subjectSelection);
     if (this.subjectOwner) throw new Error("A subject selection session already owns the pipeline");
     if (policy && this.sessions.size) throw new Error("Close existing RVM sessions before selecting subjects");
-    clearTimeout(this.idleTimer);
-    if (this.resetPromise) await this.resetPromise;
-    await this.ensureWorker();
-    if (policy && (!this.subjectModelReady || this.fixture)) throw new Error("Subject instance model is unavailable");
-    if (this.stopping) throw new Error("RVM service is stopping");
     if (this.sessions.size >= 16) throw new Error("Too many RVM sessions");
-    if (options.resetState && !this.fixture && this.worker) {
-      const work = (async () => { if (this.stillTask) await this.stillTask.catch(() => undefined); await this.worker.reset(); this.sequenceTimes.clear(); this.latestSourceFrame = null; })();
-      this.resetPromise = work;
-      try { await work; } finally { if (this.resetPromise === work) this.resetPromise = null; }
-    }
-    if (this.status !== "ready") throw new Error("RVM is not ready"); await this.ensureCameraSource();
+    await this.preparePipeline({ policy, resetState: options.resetState });
     const id = crypto.randomUUID(), maskStreamId = crypto.randomUUID(), exp = Math.floor(Date.now() / 1000) + 120;
     const capability = signCapability({ aud: "rvm", scope: "stream:read", session: id, streamId: maskStreamId, exp }, this.capabilitySecret);
     const item = { id, sourceStreamId: this.sourceSession.streamId, maskStreamId, maskEndpoint: this.paths.stream, capability, expiresAt: new Date(exp * 1000).toISOString() };
@@ -400,17 +462,22 @@ class RvmService {
     const cameraSocket = this.cameraSocket, sourceSession = this.sourceSession;
     this.cameraSocket = null; this.sourceSession = null; cameraSocket?.destroy(); this.latestSourceFrame = null;
     const work = (async () => {
-      if (this.stillTask) await this.stillTask.catch(() => undefined);
-      if (!this.fixture && this.worker) await this.worker.reset();
-      this.sequenceTimes.clear(); this.metrics.maskFps = 0;
-      if (sourceSession) await this.cameraRequest("DELETE", `/v1/sessions/${sourceSession.id}`).catch(() => undefined);
-      // Drop native allocator memory after a quiet interval, not every person.
-      clearTimeout(this.idleTimer);
-      this.idleTimer = setTimeout(() => {
-        if (this.sessions.size || this.stillTask || this.cameraSocket || this.stopping) return;
-        this.worker?.stop(); this.worker = null;
-      }, 5 * 60_000);
-      this.idleTimer.unref?.();
+      try {
+        if (this.stillTask) await this.stillTask.catch(() => undefined);
+        if (!this.fixture && this.worker) await this.worker.reset();
+      } finally {
+        this.sequenceTimes.clear(); this.metrics.maskFps = 0;
+        // Ownership is already detached above. Preserve this captured ID even
+        // if the worker reset fails, otherwise no later cleanup can release it.
+        if (sourceSession) await this.cameraRequest("DELETE", `/v1/sessions/${sourceSession.id}`).catch(() => undefined);
+        // Drop native allocator memory after a quiet interval, not every person.
+        clearTimeout(this.idleTimer);
+        this.idleTimer = setTimeout(() => {
+          if (this.sessions.size || this.stillTask || this.cameraSocket || this.stopping) return;
+          this.worker?.stop(); this.worker = null;
+        }, 5 * 60_000);
+        this.idleTimer.unref?.();
+      }
     })();
     this.resetPromise = work;
     return work.catch(error => {
@@ -421,7 +488,7 @@ class RvmService {
   }
   stillMatte(cameraArtifact, selection) {
     if (this.subjectOwner && (selection?.sessionId !== this.subjectOwner || !this.subjectLock || selection?.lockId !== this.subjectLock)) return Promise.reject(new Error("Subject lock is required for native verification"));
-    if (this.stillTask || this.resetPromise) return Promise.reject(new Error("RVM native capture is busy"));
+    if (this.stillTask || this.resetPromise || this.pipelinePreparing) return Promise.reject(new Error("RVM native capture is busy"));
     const retainedBytes = [...this.artifacts.values()].reduce((sum, item) => sum + item.payload.length, 0);
     if (this.artifacts.size > 6 || retainedBytes > 192 * 1024 * 1024) return Promise.reject(new Error("Read or expire previous native artifacts before requesting another capture"));
     clearTimeout(this.idleTimer);
@@ -493,7 +560,11 @@ class RvmService {
         return json(res,200,url.pathname.endsWith('/download')?this.models.startDownload(body.id):url.pathname.endsWith('/cancel')?this.models.cancelDownload():await this.changeModel(body.id));
       }
       if (req.method === "GET" && url.pathname === "/v1/capabilities") return json(res, 200, { apiVersion: API_VERSION, input: { profile: "matting-720p24", codec: "mjpeg", minimumFps: 24 }, output: { codec: "gray8", sequenceAligned: true, maximumLagMs: 150 }, nativeStill: true });
-      if (req.method === "POST" && url.pathname === "/v1/sessions") return json(res, 201, await this.createSession(await readJson(req)));
+      if (req.method === "POST" && url.pathname === "/v1/sessions") {
+        const item = await this.createSession(await readJson(req));
+        if (res.destroyed) { await this.deleteSession(item.id); return; }
+        return json(res, 201, item);
+      }
       const sessionMatch = url.pathname.match(/^\/v1\/sessions\/([a-f0-9-]+)$/);
       if (req.method === "DELETE" && sessionMatch) return json(res, 200, { status: await this.deleteSession(sessionMatch[1]) ? "deleted" : "already-absent" });
       const subjectMatch = url.pathname.match(/^\/v1\/sessions\/([a-f0-9-]+)\/subjects\/(lock|unlock)$/);
@@ -507,7 +578,7 @@ class RvmService {
         res.writeHead(200, { "content-type": item.mimeType, "content-length": item.payload.length, "x-image-width": item.width, "x-image-height": item.height, "cache-control": "no-store" }); return res.end(item.payload);
       }
       return json(res, 404, { error: "Not found" });
-    } catch (error) { return json(res, 503, { error: error.message, code: error.code || "RVM_REQUEST_FAILED" }); }
+    } catch (error) { if (!res.destroyed) return json(res, 503, { error: error.message, code: error.code || "RVM_REQUEST_FAILED" }); }
   }
   handleStream(socket) {
     const subscriber = { socket, authorized: false, closed: false, blocked: false, pending: null, streamId: null }; let handshake = Buffer.alloc(0);

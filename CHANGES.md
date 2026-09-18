@@ -1,6 +1,6 @@
 # Changes from upstream Robust Video Matting
 
-Navbea RVM 1.1.1-local uses the unmodified official
+Navbea RVM 1.1.4-local uses the unmodified official
 `rvm_mobilenetv3_fp32.onnx` model published with Robust Video Matting v1.0.0.
 The model SHA-256 is recorded in `models/manifest.json`.
 
@@ -20,6 +20,10 @@ upstream model:
 - FP16-aware tensor input handling and actual execution-provider reporting;
 - a model-management interface with hardware memory guidance and a separate
   administrator-only mutation channel. The bundled FP32 default is unchanged.
+- concurrent, demand-only camera and model initialization, stream handshake
+  validation and startup timings, with cleanup of failed or abandoned sessions;
+- explicit camera-source retry eligibility, current-worker callback ownership
+  and preservation of worker failures when late masks arrive;
 - an opt-in background-removed camera preview using sequence/timestamp-matched
   JPEG and alpha frames, expiring viewer leases and no extra inference pass.
 
