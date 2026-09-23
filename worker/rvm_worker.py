@@ -171,12 +171,21 @@ class OnnxRvmEngine:
         self.session_options.add_session_config_entry("session.use_env_allocators", "0")
         self.run_options = ort.RunOptions()
         self.run_options.only_execute_path_to_fetches = True
-        self.session = ort.InferenceSession(self.model_path, sess_options=self.session_options, providers=providers)
+        try:
+            self.session = ort.InferenceSession(self.model_path, sess_options=self.session_options, providers=providers)
+        except Exception:
+            if device_mode != "auto" or providers[0] == "CPUExecutionProvider":
+                raise
+            # The runtime can advertise DirectML without a usable adapter/driver.
+            # Auto mode must still start on computers without compatible GPU hardware.
+            self.session_options.enable_mem_pattern = True
+            self.session = ort.InferenceSession(self.model_path, sess_options=self.session_options, providers=["CPUExecutionProvider"])
+            print(json.dumps({"event":"provider-change","provider":"CPUExecutionProvider","reason":"GPU initialization fallback"}),file=sys.stderr,flush=True)
         self.input_types = {item.name: item.type for item in self.session.get_inputs()}
         if self.input_types.get("src") not in ("tensor(float)", "tensor(float16)"):
             raise ValueError("RVM model requires FP32 or FP16 inputs")
         self.tensor_dtype = np.float16 if self.input_types["src"] == "tensor(float16)" else np.float32
-        self.primary_provider = providers[0]
+        self.primary_provider = self.session.get_providers()[0]
         self.cpu_session = None
         self.native_session = None
         self.still_threads = still_threads or self.session_options.intra_op_num_threads
