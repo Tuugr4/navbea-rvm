@@ -15,8 +15,8 @@ const { endpointPaths } = loadProtocol();
 const serviceMode = process.argv.includes("--service");
 const modelAdmin=process.argv.includes('--model-admin');
 if(modelAdmin){
-  const [action,id]=process.argv.slice(process.argv.indexOf('--model-admin')+1);const controller=require('./model-control.cjs');
-  Promise.resolve().then(()=>{if(!app.isPackaged||process.platform!=='win32')throw Error('Installed Windows application required');controller.check(action,id);return controller.request({dataRoot:path.join(process.env.PROGRAMDATA||'C:\\ProgramData','Navbea','RVM'),control:endpointPaths('rvm','win32',{}).control,role:'admin'},'/v1/models/'+action,{id});}).then(()=>app.exit(0),error=>{console.error(error.message);app.exit(1);});
+  const controller=require('./model-control.cjs');const {kind,action,id}=controller.adminArguments(process.argv.slice(process.argv.indexOf('--model-admin')+1));
+  Promise.resolve().then(()=>{if(!app.isPackaged||process.platform!=='win32')throw Error('Installed Windows application required');controller.check(action,id,kind);return controller.request({dataRoot:path.join(process.env.PROGRAMDATA||'C:\\ProgramData','Navbea','RVM'),control:endpointPaths('rvm','win32',{}).control,role:'admin'},controller.prefixes[kind]+'/'+action,{id});}).then(()=>app.exit(0),error=>{console.error(error.message);app.exit(1);});
 } else if (serviceMode) {
   const machineRoot = process.env.PROGRAMDATA || "C:\\ProgramData";
   process.env.NAVBEA_PROTOCOL_PATH ||= path.join(process.resourcesPath, "local-media-protocol", "index.cjs");
@@ -50,8 +50,11 @@ ipcMain.handle('rvm:models',event=>{requireModelWindow(event);return modelContro
 ipcMain.handle('rvm:preview-start',event=>{requireModelWindow(event);return previewClient.start();});
 ipcMain.handle('rvm:preview-frame',event=>{requireModelWindow(event);return previewClient.frame();});
 ipcMain.handle('rvm:preview-stop',event=>{requireModelWindow(event);return previewClient.stop();});
+ipcMain.handle('rvm:still-models',event=>{requireModelWindow(event);return modelController.request(modelOptions(),'/v1/still-models');});
 let modelAction=null;
-ipcMain.handle('rvm:model-action',(event,action,id)=>{requireModelWindow(event);modelController.check(action,id);if(modelAction)throw Error('Model işlemi sürüyor.');modelAction=modelController.administer(modelOptions(),action,id).finally(()=>{modelAction=null;});return modelAction;});
+const runModelAction=(event,action,id,kind)=>{requireModelWindow(event);modelController.check(action,id,kind);if(modelAction)throw Error('Model işlemi sürüyor.');modelAction=modelController.administer(modelOptions(),action,id,kind).finally(()=>{modelAction=null;});return modelAction;};
+ipcMain.handle('rvm:model-action',(event,action,id)=>runModelAction(event,action,id,'live'));
+ipcMain.handle('rvm:still-model-action',(event,action,id)=>runModelAction(event,action,id,'still'));
 ipcMain.handle("rvm:open-source", () => app.getVersion().includes("-local") && app.isPackaged ? shell.openPath(resource("source")) : shell.openExternal("https://github.com/Tuugr4/navbea-rvm/releases/tag/v1.0.4"));
 ipcMain.handle("rvm:open-upstream", () => shell.openExternal("https://github.com/PeterL1n/RobustVideoMatting"));
 ipcMain.handle("rvm:open-license", () => shell.openPath(resource("LICENSE")));

@@ -18,6 +18,8 @@ from pathlib import Path
 # Explicit sibling import also works in the isolated packaged Python (-I).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from still_matte import StillMatteEngine, emit, estimate_foreground  # noqa: E402
+
 MAGIC = b"NVF1"
 VERSION = 1
 HEADER = struct.Struct(">4sHHIQQIIIHH16sI")
@@ -194,6 +196,9 @@ class OnnxRvmEngine:
         # Bound the encoder's working resolution for high-MP stills. The guided
         # refinement, foreground and alpha output retain the original resolution.
         self.still_max_edge = still_max_edge
+        self.still_engine = None
+        self.still_deadline_ms = 5000
+        self.last_still = None
         self.foreground_jpeg = None
         self.rec = [np.zeros((1, 1, 1, 1), dtype=self.tensor_dtype) for _ in range(4)]
         self.rec_initialized = False
@@ -265,18 +270,46 @@ class OnnxRvmEngine:
         self.np.rint(values, out=values)
         return values.astype(self.np.uint8)
 
+    def _still_alpha(self, job, width: int, height: int, started: float):
+        """Native alpha from the still model, or None to keep RVM's result."""
+        engine = self.still_engine
+        report = {"model": engine.name, "provider": engine.provider, "deadlineMs": self.still_deadline_ms, "used": "rvm"}
+        self.last_still = report
+        if job is None:
+            report["fallback"] = engine.status() or "unavailable"
+            return None
+        remaining = self.still_deadline_ms / 1000 - (time.perf_counter() - started)
+        if not job.done.wait(max(0.0, remaining)):
+            job.cancel()
+            report["fallback"] = "timeout"
+            return None
+        if job.error is not None:
+            report.update(fallback="error", error=job.error)
+            return None
+        try:
+            alpha = engine.alpha(job, width, height)
+        except Exception as error:
+            report.update(fallback="error", error=str(error)[:300])
+            return None
+        report.update(used=engine.name, inferenceMs=job.inference_ms)
+        return alpha
+
     def process(self, payload: bytes, native: bool = False) -> tuple[bytes, int, int]:
         image = self.Image.open(io.BytesIO(payload)).convert("RGB")
         if not native and (image.width > 1280 or image.height > 720):
             scale = min(1280 / image.width, 720 / image.height)
             image = image.resize((max(1, round(image.width * scale)), max(1, round(image.height * scale))), self.Image.Resampling.BILINEAR)
         width, height = image.size
+        rgb = self.np.asarray(image)
         src = self.np.empty((1, 3, height, width), dtype=self.tensor_dtype)
-        src[0] = self.np.asarray(image).transpose(2, 0, 1)
+        src[0] = rgb.transpose(2, 0, 1)
         src *= 1.0 / 255.0
         image.close()
         self.foreground_jpeg = None
+        self.last_still = None
         if native:
+            started = time.perf_counter()
+            job = self.still_engine.start(rgb) if self.still_engine else None
             # Keep the fast DirectML live session intact. Native stills use a
             # fresh CPU recurrence so their different resolution cannot crash
             # the DirectML Expand nodes.
@@ -285,6 +318,23 @@ class OnnxRvmEngine:
             ratio = self.np.asarray([min(float(self.still_ratio[0]), self.still_max_edge / max(width, height))], dtype=self.np.float32) if self.still_max_edge else self.still_ratio
             outputs = self._run(session, src, native_rec, ratio)
             del src
+            if self.still_engine is not None:
+                alpha = self._still_alpha(job, width, height, started)
+                if alpha is not None:
+                    outputs = None
+                    try:
+                        foreground = estimate_foreground(self.np, self.Image, rgb, alpha)
+                    except Exception as error:
+                        # RVM's foreground is already released; keep the model's
+                        # alpha with the camera's own colours.
+                        foreground = rgb
+                        self.last_still["foreground"] = f"camera ({str(error)[:120]})"
+                    encoded = io.BytesIO()
+                    self.Image.fromarray(foreground).save(encoded, "JPEG", quality=97, subsampling=0)
+                    self.foreground_jpeg = encoded.getvalue()
+                    self.last_still["totalMs"] = round((time.perf_counter() - started) * 1000)
+                    return alpha.tobytes(), width, height
+            del rgb
             foreground = self._bytes(outputs[0][0].transpose(1, 2, 0))
             outputs[0] = None
             encoded = io.BytesIO()
@@ -373,6 +423,12 @@ def serve(engine, input_stream=None, output_stream=None, selector=None) -> int:
         if native_still and not isinstance(engine, OnnxRvmEngine) and hasattr(engine, "reset"):
             engine.reset()
         foreground = getattr(engine, "foreground_jpeg", None)
+        matte = getattr(engine, "last_still", None) if native_still else None
+        if matte:
+            emit("still-matte", sequence=frame["sequence"], **matte)
+            if metadata is not None:
+                metadata = {**metadata, "matte": matte}
+            engine.last_still = None
         if metadata is not None:
             if support is not None:
                 mask = selector.filter_alpha(mask, width, height, support)
@@ -416,6 +472,35 @@ def self_test() -> int:
     return 0
 
 
+def check_still_model(model_path: Path, device_mode: str, threads: int) -> int:
+    """Load a still model and time one full native-size matte (24 MP, 3:2)."""
+    import numpy as np
+    from PIL import Image
+
+    engine = StillMatteEngine(model_path, device_mode, select_onnx_providers, threads, block=True)
+    if engine.session is None:
+        raise RuntimeError(engine.error or "Still model failed to load")
+    width, height = 6000, 4000
+    rgb = np.empty((height, width, 3), dtype=np.uint8)
+    rgb[...] = (80, 100, 120)
+    rgb[height // 4: height, width // 3: 2 * width // 3] = (200, 160, 140)
+    started = time.perf_counter()
+    job = engine.start(rgb)
+    job.done.wait()
+    if job.error:
+        raise RuntimeError(job.error)
+    alpha = engine.alpha(job, width, height)
+    if alpha.shape != (height, width):
+        raise RuntimeError("Still model returned an invalid alpha size")
+    foreground = estimate_foreground(np, Image, rgb, alpha)
+    Image.fromarray(foreground).save(io.BytesIO(), "JPEG", quality=97, subsampling=0)
+    print(json.dumps({
+        "verified": True, "provider": engine.provider, "warmupMs": engine.warmup_ms, "probeMs": job.inference_ms, "totalMs": round((time.perf_counter() - started) * 1000),
+        "input": list(engine.size), "width": width, "height": height,
+    }))
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=os.environ.get("RVM_MODEL_PATH", ""))
@@ -426,6 +511,10 @@ def main() -> int:
     parser.add_argument("--still-max-edge", type=int, choices=(0, 512, 768, 1024), default=1024)
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--still-threads", type=int, default=0)
+    parser.add_argument("--still-model", default="")
+    parser.add_argument("--still-device", choices=("auto", "cuda", "directml", "cpu"), default="auto")
+    parser.add_argument("--still-deadline-ms", type=int, default=5000)
+    parser.add_argument("--check-still-model", action="store_true")
     parser.add_argument("--fixture", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--startup-id", default="")
@@ -439,7 +528,11 @@ def main() -> int:
         return 0
     if not 0 < args.downsample_ratio <= 1 or not 0 < args.still_ratio <= 1 or not 0 <= args.threads <= (os.cpu_count() or 1) or not 0 <= args.still_threads <= (os.cpu_count() or 1):
         parser.error("Ratios must be in (0, 1]; threads must be 0 (automatic) or an available processor count")
+    if not 500 <= args.still_deadline_ms <= 30000:
+        parser.error("--still-deadline-ms must be between 500 and 30000")
     if args.self_test: return self_test()
+    if args.check_still_model:
+        return check_still_model(Path(args.still_model).resolve(), args.still_device, args.threads)
     model_path = Path(args.model).resolve()
     engine = FixtureEngine() if args.fixture else OnnxRvmEngine(model_path, args.device, args.downsample_ratio, args.still_ratio, args.threads, args.still_max_edge, args.still_threads) if model_path.suffix.lower() == ".onnx" else RvmEngine(model_path, args.device, args.downsample_ratio)
     if not args.fixture:
@@ -463,6 +556,9 @@ def main() -> int:
             engine.reset()
             print(json.dumps({"verified":True,"provider":engine.primary_provider,"precision":"fp16" if engine.input_types["src"]=="tensor(float16)" else "fp32","probeMs":round((time.perf_counter()-started)*1000),"width":width,"height":height,"providers":engine.ort.get_available_providers()}))
             return 0
+    if args.still_model and isinstance(engine, OnnxRvmEngine):
+        engine.still_engine = StillMatteEngine(Path(args.still_model).resolve(), args.still_device, select_onnx_providers, args.still_threads)
+        engine.still_deadline_ms = args.still_deadline_ms
     selector = None
     if args.subject_model:
         from subjects import PersonDetector, SubjectSelector

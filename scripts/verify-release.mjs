@@ -17,7 +17,7 @@ if (subjectHash !== subjects.sha256) throw new Error("Subject instance model che
 const required = [
   "README.md", "SOURCE_OFFER.md", "CHANGES.md", "THIRD_PARTY_NOTICES.md", "SBOM.spdx.json",
   "THIRD_PARTY_LICENSES/React-ReactDOM-Scheduler-MIT.txt", "THIRD_PARTY_LICENSES/Phosphor-Icons-MIT.txt",
-  "local-media-protocol/LICENSE", "local-media-protocol/subjects.cjs", "worker/rvm_worker.py", "worker/subjects.py",
+  "local-media-protocol/LICENSE", "local-media-protocol/subjects.cjs", "worker/rvm_worker.py", "worker/subjects.py", "worker/still_matte.py", "models/still-catalog.json",
   "THIRD_PARTY_LICENSES/YOLOv5-GPL-3.0.txt", "THIRD_PARTY_LICENSES/YOLOv5-NOTICE.txt",
 ];
 for (const item of required) await stat(path.join(root, item));

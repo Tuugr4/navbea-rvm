@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "defaultModel": "rvm",
+  "upstream": "https://github.com/ZhengPeng7/BiRefNet",
+  "license": "MIT",
+  "models": [
+    {"id":"rvm","name":"RVM (canlı model)","architecture":"rvm","builtin":true,"file":"","bytes":0,"sha256":"","recommendedMemoryGiB":0,"note":"Varsayılan · fotoğraf, canlı önizlemedeki RVM modeliyle maskelenir."},
+    {"id":"birefnet-lite-fp16","name":"BiRefNet Lite FP16","architecture":"birefnet","precision":"fp16","file":"birefnet_lite_fp16.onnx","url":"https://huggingface.co/onnx-community/BiRefNet_lite-ONNX/resolve/de15b22ba131738a16dff04aab8bdf8dc32e3ac1/onnx/model_fp16.onnx","bytes":114538221,"sha256":"d39b897ceb16ae654c1731f3dba0cf9b368d9cae74b5a57459b455cc8bfec402","license":"MIT","minimumMemoryGiB":4,"recommendedMemoryGiB":8,"note":"Önerilen. Saç ve kenarlar RVM'den belirgin şekilde temiz. GPU gerekir; etkinleştirmeden önce bu bilgisayarda süre testi yapılır."},
+    {"id":"birefnet-portrait-fp16","name":"BiRefNet Portrait FP16","architecture":"birefnet","precision":"fp16","file":"birefnet_portrait_fp16.onnx","url":"https://huggingface.co/onnx-community/BiRefNet-portrait-ONNX/resolve/dd7167f6a8b54ff7efc29a4c988938d79866464f/onnx/model_fp16.onnx","bytes":489666272,"sha256":"4c05930c0b6f1418d02eb1de81c46fe37638ba54f5a93adeb5c674521db10110","license":"MIT","minimumMemoryGiB":8,"recommendedMemoryGiB":16,"note":"En iyi insan maskesi; Lite'tan yaklaşık iki kat yavaş. Güçlü GPU gerekir."}
+  ]
+}

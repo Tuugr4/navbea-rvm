@@ -9,7 +9,8 @@ const path = require("node:path");
 const { spawn, execFile } = require("node:child_process");
 const { resolveCpuProfile } = require("./cpu-profile.cjs");
 const { ModelManager } = require('./model-manager.cjs');
-const { runModelProbe } = require('./model-probe.cjs');
+const { runModelProbe, runStillProbe } = require('./model-probe.cjs');
+const stillCatalog = require('../models/still-catalog.json');
 const { LivePreview } = require('./live-preview.cjs');
 
 function loadProtocol() {
@@ -70,6 +71,7 @@ class PythonWorker {
     args.push("--still-max-edge", String(this.options.stillMaxEdge ?? 1024));
     args.push("--still-threads", String(this.options.stillThreads ?? 0));
     if (this.options.subjectModel) args.push("--subject-model", this.options.subjectModel);
+    if (this.options.stillModel) args.push("--still-model", this.options.stillModel, "--still-device", this.options.stillDevice || "auto", "--still-deadline-ms", String(this.options.stillDeadlineMs ?? 5000));
     this.child = spawn(this.options.python, args, { windowsHide: true, shell: false, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PYTHONUNBUFFERED: "1" } });
     this.child.stdout.on("data", chunk => {
       try { for (let frame of this.decoder.push(chunk)) {
@@ -106,6 +108,7 @@ class PythonWorker {
           try {
             const event = JSON.parse(line);
             if(event.event==='provider-change'&&typeof event.provider==='string'){this.actualProvider=event.provider;this.onProvider?.(event.provider,event.reason);}
+            if(typeof event.event==='string'&&event.event.startsWith('still-matte'))this.onStillMatte?.(event);
             if (!settled && event.event === "rvm-ready" && event.protocol === 1 && event.startupId === startupId && event.inferenceVerified === true) {
               this.actualProvider=event.provider;this.onProvider?.(event.provider);
               settled = true; clearTimeout(timer); resolve();
@@ -196,8 +199,10 @@ class RvmService {
     const python = this.env.RVM_PYTHON_PATH || first(this.platform === "win32" ? [path.join(packagedRoot, "runtime", "python.exe"), path.join(packagedRoot, "runtime", "Scripts", "python.exe"), path.join(packagedRoot, ".runtime-build", "Scripts", "python.exe"), path.join(packagedRoot, ".venv", "Scripts", "python.exe")] : [path.join(packagedRoot, "runtime", "bin", "python"), path.join(packagedRoot, ".runtime-build", "bin", "python"), path.join(packagedRoot, ".venv", "bin", "python")]);
     const selected=this.models?.active;
     const model = selected ? this.models.file(this.models.entry(selected.id)) : this.env.RVM_MODEL_PATH || first([path.join(packagedRoot, "models", "rvm_mobilenetv3_fp32.onnx"), path.join(packagedRoot, "rvm_mobilenetv3_fp32.onnx"), path.join(packagedRoot, "models", "rvm_mobilenetv3_fp32.torchscript"), path.join(packagedRoot, "rvm_mobilenetv3_fp32.torchscript")]);
-    return { python, script: path.join(packagedRoot, "worker", "rvm_worker.py"), model, device: selected&&selected.id!==this.models.catalogue.defaultModel?selected.device:this.env.RVM_DEVICE || "cpu", liveRatio: Number(this.env.RVM_LIVE_RATIO || 0.375), stillRatio: Number(this.env.RVM_STILL_RATIO || 0.5), stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), threads: this.env.RVM_CPU_THREADS || "auto", cpuBudget: this.env.RVM_CPU_BUDGET || "auto", logPath: path.join(this.dataRoot, "worker.log"), debugDir: this.env.RVM_DEBUG_FRAME_DIR || "" };
+    const still=this.stillModels?.active&&this.stillModels.entry(this.stillModels.active.id);
+    return { python, script: path.join(packagedRoot, "worker", "rvm_worker.py"), model, stillModel: still&&!still.builtin?this.stillModels.file(still):"", stillDevice: this.env.RVM_STILL_DEVICE || "auto", stillDeadlineMs: this.stillDeadlineMs(), device: selected&&selected.id!==this.models.catalogue.defaultModel?selected.device:this.env.RVM_DEVICE || "cpu", liveRatio: Number(this.env.RVM_LIVE_RATIO || 0.375), stillRatio: Number(this.env.RVM_STILL_RATIO || 0.5), stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), threads: this.env.RVM_CPU_THREADS || "auto", cpuBudget: this.env.RVM_CPU_BUDGET || "auto", logPath: path.join(this.dataRoot, "worker.log"), debugDir: this.env.RVM_DEBUG_FRAME_DIR || "" };
   }
+  stillDeadlineMs() { const value = Number(this.env.RVM_STILL_DEADLINE_MS || 5000); return Number.isInteger(value) && value >= 500 && value <= 30000 ? value : 5000; }
   ensureWorker() {
     if (this.workerStartPromise) return this.workerStartPromise;
     if (this.worker || this.fixture) return Promise.resolve();
@@ -218,7 +223,7 @@ class RvmService {
       options.subjectModel = subjectModel;
     }
     this.subjectModelReady = Boolean(options.subjectModel);
-    for (const target of [options.python, options.script, options.model]) await fsp.access(target);
+    for (const target of [options.python, options.script, options.model, options.stillModel].filter(Boolean)) await fsp.access(target);
     this.status = "starting";
     this.metrics.threadMode = "calibrating";
     const profile = this.workerProfile || await resolveCpuProfile(options, this.dataRoot);
@@ -234,6 +239,14 @@ class RvmService {
     this.worker = new PythonWorker(options);
     const worker = this.worker;
     worker.onProvider=(provider,reason)=>{if(this.worker!==worker)return;this.metrics.device=provider;this.metrics.providerFallback=reason||null;};
+    const stillId=options.stillModel?this.stillModels.active.id:null;
+    this.metrics.stillModel=stillId?{id:stillId,status:'loading'}:null;
+    worker.onStillMatte=event=>{
+      if(this.worker!==worker)return;
+      if(event.event==='still-matte-ready')this.metrics.stillModel={id:stillId,status:'ready',provider:event.provider,warmupMs:event.warmupMs};
+      else if(event.event==='still-matte-unavailable')this.metrics.stillModel={id:stillId,status:'unavailable',reason:String(event.reason||'').slice(0,300)};
+      else if(event.event==='still-matte'){const {event:_event,...matte}=event;this.metrics.lastStillMatte={...matte,at:new Date().toISOString()};}
+    };
     worker.onMask = frame => { if (this.worker === worker) this.acceptMask(frame); };
     worker.onFailure = error => { if (this.worker !== worker) return; this.workerFailure = error; this.status = "unavailable"; this.errorCode = "RVM_WORKER_PIPE_FAILED"; this.error = error.message; };
     const startedAt = Date.now();
@@ -241,7 +254,7 @@ class RvmService {
     try { await worker.start(); }
     catch (error) { worker.stop(); if (this.worker === worker) this.worker = null; throw error; }
     if (this.stopping) { worker.stop(); this.worker = null; return; }
-    this.loadedModelId=this.models?.active.id;
+    this.loadedModelId=this.models?.active.id;this.loadedStillModelId=this.stillModels?.active.id;
     this.workerFailure = null;
     this.status = "ready"; this.errorCode = null; this.error = null;
   }
@@ -341,7 +354,7 @@ class RvmService {
       && !this.stopping && !this.modelChange && !this.modelsInitializing && !this.pipelinePreparing && !this.resetPromise
       && !this.stillTask && !this.workerStartPromise && !this.sourceStartPromise && !this.sessions.size && !this.subjectOwner);
   }
-  health() { return { status: this.status, readiness: { canRetryOpenSession: this.canRetryOpenSession() }, service: "rvm", sourceTimestamps: "camera-monotonic", version: VERSION, build: buildInfo, apiVersion: API_VERSION, uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000), errorCode: this.errorCode, error: this.error, sourceSession: this.sourceSession?.id || null, workerState: this.worker ? (this.stillCaptureBusy ? "native" : this.resetPromise ? "resetting" : "warm") : this.fixture ? "fixture" : "idle", modelSha256: this.workerProfile?.modelHash || null, metrics: { frames: this.metrics.frames, dropped: this.metrics.dropped, maskFps: this.metrics.maskFps, inferenceMs: this.metrics.inferenceMs === null ? null : Number(this.metrics.inferenceMs.toFixed(2)), device: this.metrics.device, threads: this.metrics.threads ?? null, threadMode: this.metrics.threadMode ?? null, availableProcessors: this.metrics.availableProcessors ?? null, physicalCores: this.metrics.physicalCores ?? null, cpuBudget: this.workerProfile?.budget ?? null, stillThreads: this.metrics.stillThreads ?? null, stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), stillRatio: Number(this.env.RVM_STILL_RATIO || .5), lastStill: this.metrics.lastStill || null, lastStartup: this.metrics.lastStartup || null } }; }
+  health() { return { status: this.status, readiness: { canRetryOpenSession: this.canRetryOpenSession() }, service: "rvm", sourceTimestamps: "camera-monotonic", version: VERSION, build: buildInfo, apiVersion: API_VERSION, uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000), errorCode: this.errorCode, error: this.error, sourceSession: this.sourceSession?.id || null, workerState: this.worker ? (this.stillCaptureBusy ? "native" : this.resetPromise ? "resetting" : "warm") : this.fixture ? "fixture" : "idle", modelSha256: this.workerProfile?.modelHash || null, metrics: { frames: this.metrics.frames, dropped: this.metrics.dropped, maskFps: this.metrics.maskFps, inferenceMs: this.metrics.inferenceMs === null ? null : Number(this.metrics.inferenceMs.toFixed(2)), device: this.metrics.device, threads: this.metrics.threads ?? null, threadMode: this.metrics.threadMode ?? null, availableProcessors: this.metrics.availableProcessors ?? null, physicalCores: this.metrics.physicalCores ?? null, cpuBudget: this.workerProfile?.budget ?? null, stillThreads: this.metrics.stillThreads ?? null, stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), stillRatio: Number(this.env.RVM_STILL_RATIO || .5), lastStill: this.metrics.lastStill || null, stillModel: this.metrics.stillModel || null, stillDeadlineMs: this.stillDeadlineMs(), lastStillMatte: this.metrics.lastStillMatte || null, lastStartup: this.metrics.lastStartup || null } }; }
   authorized(req,role='client') { const a = Buffer.from(String(req.headers[role==='admin'?'x-navbea-admin-token':"x-navbea-client-token"] || "")); const secret=role==='admin'?this.adminSecret:this.clientSecret; if(!secret)return false;const b = Buffer.from(String(secret)); return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b); }
   modelsStatus(){if(this.modelsInitializing)return{available:false,error:'Modeller kontrol ediliyor.'};if(!this.models)return{available:false,error:'Model yönetimi henüz hazır değil.'};const status=this.models.snapshot();const activeId=this.loadedModelId||status.active.id;return {...status,available:true,active:{...status.active,id:activeId},models:status.models.map(item=>({...item,active:item.id===activeId})),switching:Boolean(this.modelChange)||status.switching,activeSessions:this.sessions.size,actualProvider:this.metrics.device};}
   changeModel(id){return this.lifecycle(async()=>{
@@ -358,6 +371,21 @@ class RvmService {
       try{await this.startWorker();}
       catch(error){await this.models.restore(previous,'Yeni model başlatılamadı; önceki model geri yüklendi. '+error.message);this.worker?.stop();this.worker=null;this.workerProfile=null;await this.startWorker();throw error;}
       return this.modelsStatus();
+    }finally{this.modelChange=false;}
+  });}
+  stillModelsStatus(){if(this.modelsInitializing)return{available:false,error:'Modeller kontrol ediliyor.'};if(!this.stillModels)return{available:false,error:this.stillModelError||'Fotoğraf maskesi modelleri hazır değil.'};const status=this.stillModels.snapshot();const activeId=this.loadedStillModelId||status.active.id;return {...status,available:true,active:{...status.active,id:activeId},models:status.models.map(item=>({...item,active:item.id===activeId})),switching:Boolean(this.modelChange)||status.switching,activeSessions:this.sessions.size,deadlineMs:this.stillDeadlineMs(),runtime:this.metrics.stillModel||null,lastStillMatte:this.metrics.lastStillMatte||null};}
+  changeStillModel(id){return this.lifecycle(async()=>{
+    if(!this.stillModels)throw Error('Fotoğraf maskesi modelleri hazır değil.');
+    if(this.preview.active)throw Error('Model değiştirmek için canlı önizlemeyi kapatın.');
+    if(this.sessions.size||this.stillTask||this.resetPromise||this.workerStartPromise)throw Error('Model değiştirmek için aktif çekim oturumunun bitmesini bekleyin.');
+    const previous={...this.stillModels.active};this.modelChange=true;
+    try{
+      await this.stillModels.activate(id);if(previous.id===this.stillModels.active.id)return this.stillModelsStatus();
+      if(!this.worker)return this.stillModelsStatus();
+      this.worker.stop();this.worker=null;this.workerRestarts=0;
+      try{await this.startWorker();}
+      catch(error){await this.stillModels.restore(previous,'Yeni fotoğraf modeli başlatılamadı; önceki model geri yüklendi. '+error.message);this.worker?.stop();this.worker=null;await this.startWorker();throw error;}
+      return this.stillModelsStatus();
     }finally{this.modelChange=false;}
   });}
   lifecycle(action) {
@@ -559,6 +587,13 @@ class RvmService {
         const body=await readJson(req);
         return json(res,200,url.pathname.endsWith('/download')?this.models.startDownload(body.id):url.pathname.endsWith('/cancel')?this.models.cancelDownload():await this.changeModel(body.id));
       }
+      if(req.method==='GET'&&url.pathname==='/v1/still-models')return json(res,200,this.stillModelsStatus());
+      if(req.method==='POST'&&['/v1/still-models/download','/v1/still-models/cancel','/v1/still-models/activate'].includes(url.pathname)){
+        if(!this.authorized(req,'admin'))return json(res,403,{error:'Model yönetimi için yönetici izni gerekiyor.'});
+        if(!this.stillModels||this.modelsInitializing)throw Error('Fotoğraf maskesi modelleri hazır değil.');
+        const body=await readJson(req);
+        return json(res,200,url.pathname.endsWith('/download')?(this.stillModels.startDownload(body.id),this.stillModelsStatus()):url.pathname.endsWith('/cancel')?(this.stillModels.cancelDownload(),this.stillModelsStatus()):await this.changeStillModel(body.id));
+      }
       if (req.method === "GET" && url.pathname === "/v1/capabilities") return json(res, 200, { apiVersion: API_VERSION, input: { profile: "matting-720p24", codec: "mjpeg", minimumFps: 24 }, output: { codec: "gray8", sequenceAligned: true, maximumLagMs: 150 }, nativeStill: true });
       if (req.method === "POST" && url.pathname === "/v1/sessions") {
         const item = await this.createSession(await readJson(req));
@@ -610,16 +645,23 @@ class RvmService {
       await this.listen(this.controlServer, this.paths.control); await this.listen(this.streamServer, this.paths.stream);
       this.modelsInitializing=true;
       try {
-      if(!this.fixture){const options=this.workerOptions();this.models=new ModelManager({dataRoot:this.dataRoot,bundledRoot:path.dirname(options.model),probe:(model,device)=>runModelProbe(this.workerOptions(),model,device,this.modelAbort.signal)});try{await this.models.initialize();}catch(error){this.modelManagerError=error.message;this.models=null;}}
+      if(!this.fixture){const options=this.workerOptions();this.models=new ModelManager({dataRoot:this.dataRoot,bundledRoot:path.dirname(options.model),probe:(model,device)=>runModelProbe(this.workerOptions(),model,device,this.modelAbort.signal)});try{await this.models.initialize();}catch(error){this.modelManagerError=error.message;this.models=null;}
+        this.stillModels=new ModelManager({dataRoot:this.dataRoot,bundledRoot:path.dirname(options.model),catalogue:stillCatalog,settingsName:'still-model-selection.json',probe:model=>runStillProbe(this.workerOptions(),model,this.stillDeadlineMs(),this.modelAbort.signal)});try{await this.stillModels.initialize();}catch(error){this.stillModelError=error.message;this.stillModels=null;}}
       }finally{this.modelsInitializing=false;}
-      await this.startWorker().catch(async error => {if(this.models&&this.models.active.id!==this.models.catalogue.defaultModel){await this.models.restore({id:this.models.catalogue.defaultModel,device:'cpu'},'Seçilen model başlatılamadı; varsayılan modele dönüldü.');this.workerProfile=null;await this.startWorker().catch(error=>this.scheduleWorkerRestart(error));}else this.scheduleWorkerRestart(error);});
+      await this.startWorker().catch(async error => {
+        const live=this.models&&this.models.active.id!==this.models.catalogue.defaultModel,still=this.stillModels&&this.stillModels.active.id!==this.stillModels.catalogue.defaultModel;
+        if(!live&&!still)return this.scheduleWorkerRestart(error);
+        if(live){await this.models.restore({id:this.models.catalogue.defaultModel,device:'cpu'},'Seçilen model başlatılamadı; varsayılan modele dönüldü.');this.workerProfile=null;}
+        if(still)await this.stillModels.restore({id:this.stillModels.catalogue.defaultModel,device:'cpu'},'Seçilen fotoğraf modeli başlatılamadı; RVM kullanılıyor.');
+        await this.startWorker().catch(error=>this.scheduleWorkerRestart(error));
+      });
       return this;
     } catch (error) { await this.stop(); throw error; }
   }
   async stop() {
     this.preview.dispose();
     this.stopping = true; if (this.workerRestartTimer) clearTimeout(this.workerRestartTimer);
-    this.modelAbort.abort();this.models?.cancelDownload();await this.models?.downloadPromise;
+    this.modelAbort.abort();this.models?.cancelDownload();this.stillModels?.cancelDownload();await this.models?.downloadPromise;await this.stillModels?.downloadPromise;
     clearTimeout(this.idleTimer);
     const source = this.sourceSession, socket = this.cameraSocket;
     this.sourceSession = null; this.cameraSocket = null; socket?.destroy(); this.worker?.stop();
