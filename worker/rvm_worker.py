@@ -153,7 +153,7 @@ class RvmEngine:
 
 
 class OnnxRvmEngine:
-    def __init__(self, model_path: Path, device_mode: str = "auto", downsample_ratio: float = 0.375, still_ratio: float = 0.5, threads: int = 0, still_max_edge: int = 1024, still_threads: int = 0):
+    def __init__(self, model_path: Path, device_mode: str = "auto", downsample_ratio: float = 0.375, still_ratio: float = 0.5, threads: int = 0, still_max_edge: int = 1024, still_threads: int = 0, still_warmup: int = 4):
         import numpy as np
         import onnxruntime as ort
         from PIL import Image
@@ -196,6 +196,9 @@ class OnnxRvmEngine:
         # Bound the encoder's working resolution for high-MP stills. The guided
         # refinement, foreground and alpha output retain the original resolution.
         self.still_max_edge = still_max_edge
+        # RVM is recurrent: from a zero state a single frame leaves gaps between
+        # people and see-through clothing. Encoder-sized passes fill the state.
+        self.still_warmup = still_warmup
         self.still_engine = None
         self.still_deadline_ms = 5000
         self.last_still = None
@@ -243,15 +246,33 @@ class OnnxRvmEngine:
             self.native_session = self.ort.InferenceSession(self.model_path, sess_options=options, providers=["CPUExecutionProvider"])
         return self.native_session
 
-    def _run(self, session, src, rec, ratio=None):
-        feeds = {
-            "src": src, "r1i": rec[0], "r2i": rec[1], "r3i": rec[2],
-            "r4i": rec[3], "downsample_ratio": self.downsample_ratio if ratio is None else ratio,
-        }
+    def _feeds(self, src, rec, ratio):
+        feeds = {"src": src, "r1i": rec[0], "r2i": rec[1], "r3i": rec[2], "r4i": rec[3], "downsample_ratio": ratio}
         for name, value in feeds.items():
             dtype = self.np.float16 if self.input_types.get(name) == "tensor(float16)" else self.np.float32
             if value.dtype != dtype:
                 feeds[name] = value.astype(dtype, copy=False)
+        return feeds
+
+    def _warm_still(self, session, rgb, ratio):
+        """Recurrent state for a native still: the photo at the encoder's working
+        size, run at ratio 1 so the state matches the full-resolution pass."""
+        rec = [self.np.zeros((1, 1, 1, 1), dtype=self.tensor_dtype) for _ in range(4)]
+        if not self.still_warmup:
+            return rec
+        height, width = rgb.shape[:2]
+        size = (max(1, int(width * float(ratio[0]))), max(1, int(height * float(ratio[0]))))
+        small = self.np.asarray(self.Image.fromarray(rgb).resize(size, self.Image.Resampling.BILINEAR))
+        src = self.np.empty((1, 3, size[1], size[0]), dtype=self.tensor_dtype)
+        src[0] = small.transpose(2, 0, 1)
+        src *= 1.0 / 255.0
+        one = self.np.asarray([1.0], dtype=self.np.float32)
+        for _ in range(self.still_warmup):
+            rec = session.run(["r1o", "r2o", "r3o", "r4o"], self._feeds(src, rec, one), self.run_options)
+        return rec
+
+    def _run(self, session, src, rec, ratio=None):
+        feeds = self._feeds(src, rec, self.downsample_ratio if ratio is None else ratio)
         if ratio is None:
             # Live subscribers consume alpha only. Do not fetch the full RGB
             # foreground output until a native still actually needs it.
@@ -310,13 +331,18 @@ class OnnxRvmEngine:
         if native:
             started = time.perf_counter()
             job = self.still_engine.start(rgb) if self.still_engine else None
-            # Keep the fast DirectML live session intact. Native stills use a
-            # fresh CPU recurrence so their different resolution cannot crash
+            # Keep the fast DirectML live session intact. Native stills use their
+            # own CPU recurrence so their different resolution cannot crash
             # the DirectML Expand nodes.
-            native_rec = [self.np.zeros((1, 1, 1, 1), dtype=self.tensor_dtype) for _ in range(4)]
             session = self._native()
             ratio = self.np.asarray([min(float(self.still_ratio[0]), self.still_max_edge / max(width, height))], dtype=self.np.float32) if self.still_max_edge else self.still_ratio
-            outputs = self._run(session, src, native_rec, ratio)
+            try:
+                outputs = self._run(session, src, self._warm_still(session, rgb, ratio), ratio)
+            except Exception as error:
+                if not self.still_warmup:
+                    raise
+                print(json.dumps({"event": "still-warmup-skipped", "error": str(error)[:200]}), file=sys.stderr, flush=True)
+                outputs = self._run(session, src, [self.np.zeros((1, 1, 1, 1), dtype=self.tensor_dtype) for _ in range(4)], ratio)
             del src
             if self.still_engine is not None:
                 alpha = self._still_alpha(job, width, height, started)
@@ -511,6 +537,7 @@ def main() -> int:
     parser.add_argument("--still-max-edge", type=int, choices=(0, 512, 768, 1024), default=1024)
     parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--still-threads", type=int, default=0)
+    parser.add_argument("--still-warmup", type=int, choices=range(0, 9), default=4)
     parser.add_argument("--still-model", default="")
     parser.add_argument("--still-device", choices=("auto", "cuda", "directml", "cpu"), default="auto")
     parser.add_argument("--still-deadline-ms", type=int, default=5000)
@@ -534,7 +561,7 @@ def main() -> int:
     if args.check_still_model:
         return check_still_model(Path(args.still_model).resolve(), args.still_device, args.threads)
     model_path = Path(args.model).resolve()
-    engine = FixtureEngine() if args.fixture else OnnxRvmEngine(model_path, args.device, args.downsample_ratio, args.still_ratio, args.threads, args.still_max_edge, args.still_threads) if model_path.suffix.lower() == ".onnx" else RvmEngine(model_path, args.device, args.downsample_ratio)
+    engine = FixtureEngine() if args.fixture else OnnxRvmEngine(model_path, args.device, args.downsample_ratio, args.still_ratio, args.threads, args.still_max_edge, args.still_threads, args.still_warmup) if model_path.suffix.lower() == ".onnx" else RvmEngine(model_path, args.device, args.downsample_ratio)
     if not args.fixture:
         from PIL import Image
         sample = io.BytesIO()
