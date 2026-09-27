@@ -77,13 +77,13 @@ class PersonDetector:
         return people
 
 
-def _session(model, threads):
+def _session(model, threads, disabled_optimizers=None):
     import onnxruntime as ort
     options = ort.SessionOptions()
     options.intra_op_num_threads = max(1, min(2, threads)); options.inter_op_num_threads = 1
     options.add_session_config_entry("session.intra_op.allow_spinning", "0")
     options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-    return ort.InferenceSession(str(model), sess_options=options, providers=["CPUExecutionProvider"])
+    return ort.InferenceSession(str(model), sess_options=options, providers=["CPUExecutionProvider"], disabled_optimizers=disabled_optimizers)
 
 
 class SceneScorer:
@@ -92,7 +92,9 @@ class SceneScorer:
     The depth map is relative: larger values are closer. Nothing is stored beyond the latest frame."""
 
     def __init__(self, depth_model, face_model, threads=2):
-        self.depth = _session(depth_model, threads); self.depth_input = self.depth.get_inputs()[0]
+        # onnxruntime 1.24 (bundled runtime) fails to load the fp16 export when it
+        # fuses its layer norms; the unfused graph gives the same depth.
+        self.depth = _session(depth_model, threads, ["SimplifiedLayerNormFusion"]); self.depth_input = self.depth.get_inputs()[0]
         self.face = _session(face_model, threads); self.face_outputs = [v.name for v in self.face.get_outputs()]
 
     def depth_map(self, image, edge):
