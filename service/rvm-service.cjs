@@ -71,6 +71,7 @@ class PythonWorker {
     args.push("--still-max-edge", String(this.options.stillMaxEdge ?? 1024));
     args.push("--still-threads", String(this.options.stillThreads ?? 0));
     if (this.options.subjectModel) args.push("--subject-model", this.options.subjectModel);
+    if (this.options.depthModel && this.options.faceModel) args.push("--depth-model", this.options.depthModel, "--face-model", this.options.faceModel);
     if (this.options.stillModel) args.push("--still-model", this.options.stillModel, "--still-device", this.options.stillDevice || "auto", "--still-deadline-ms", String(this.options.stillDeadlineMs ?? 5000));
     this.child = spawn(this.options.python, args, { windowsHide: true, shell: false, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PYTHONUNBUFFERED: "1" } });
     this.child.stdout.on("data", chunk => {
@@ -223,6 +224,19 @@ class RvmService {
       options.subjectModel = subjectModel;
     }
     this.subjectModelReady = Boolean(options.subjectModel);
+    // Score mode (closest people facing the camera) needs depth and face models
+    // next to the instance model; without them the mode is simply not offered.
+    this.subjectScoringReady = false;
+    if (options.subjectModel) {
+      const scoring = require("../models/scoring.json"), files = {};
+      for (const key of ["depth", "face"]) {
+        const target = path.resolve(path.dirname(subjectModel), scoring[key].model);
+        if (!fs.existsSync(target)) break;
+        if (crypto.createHash("sha256").update(await fsp.readFile(target)).digest("hex") !== scoring[key].sha256) throw new Error("Subject scoring model integrity check failed");
+        files[key] = target;
+      }
+      if (files.depth && files.face) { options.depthModel = files.depth; options.faceModel = files.face; this.subjectScoringReady = true; }
+    }
     for (const target of [options.python, options.script, options.model, options.stillModel].filter(Boolean)) await fsp.access(target);
     this.status = "starting";
     this.metrics.threadMode = "calibrating";
@@ -411,6 +425,7 @@ class RvmService {
           await this.ensureWorker();
           timings.workerMs = Math.round(performance.now() - workerStartedAt);
           if (policy && (!this.subjectModelReady || this.fixture)) throw new Error("Subject instance model is unavailable");
+          if (policy?.mode === "score" && !this.subjectScoringReady) throw new Error("Subject scoring models are unavailable");
           if (this.stopping) throw new Error("RVM service is stopping");
           if (resetState && !this.fixture && this.worker) {
             const resetStartedAt = performance.now();
@@ -570,7 +585,7 @@ class RvmService {
   async handleControl(req, res) {
     const url = new URL(req.url, "http://local");
     try {
-      if (req.method === "GET" && url.pathname === "/v1/health") return json(res, 200, { ...this.health(), ...(this.modelChange?{status:'starting',errorCode:'RVM_MODEL_SWITCHING',error:'RVM modeli değiştiriliyor.'}:{}), model:this.models?{id:this.loadedModelId||this.models.active.id,...this.models.limits(this.loadedModelId||this.models.active.id)}:null, subjectSelection: this.subjectModelReady ? { version: 1, modes: ["area", "tracking", "all"], nativeVerification: true, occlusionGuard: true } : null });
+      if (req.method === "GET" && url.pathname === "/v1/health") return json(res, 200, { ...this.health(), ...(this.modelChange?{status:'starting',errorCode:'RVM_MODEL_SWITCHING',error:'RVM modeli değiştiriliyor.'}:{}), model:this.models?{id:this.loadedModelId||this.models.active.id,...this.models.limits(this.loadedModelId||this.models.active.id)}:null, subjectSelection: this.subjectModelReady ? { version: 1, modes: ["area", "tracking", "all", ...(this.subjectScoringReady ? ["score"] : [])], nativeVerification: true, occlusionGuard: true } : null });
       if (!this.authorized(req)&&!this.authorized(req,'admin')) return json(res, 401, { error: "Unauthorized" });
       if(req.method==='POST'&&url.pathname==='/v1/preview/start')return json(res,200,await this.preview.start());
       const previewMatch=url.pathname.match(/^\/v1\/preview\/([a-f0-9-]{36})(\/stop)?$/);

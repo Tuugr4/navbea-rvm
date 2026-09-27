@@ -39,6 +39,22 @@ the live preview always uses RVM. Foreground colour estimation follows
 Forte & Pitié, "Approximate Fast Foreground Colour Estimation" (ICIP 2021),
 reimplemented in `worker/still_matte.py`.
 
+## Subject scoring models (score mode)
+
+The "score" subject-selection mode ranks people by closeness, facing the camera
+and height, so people walking behind the guests are removed from the matte.
+Both models run locally on the CPU; no image or result is stored.
+
+- Depth Anything V2 Small (Lihe Yang, Bingyi Kang, Zilong Huang, Zhen Zhao,
+  Xiaogang Xu, Jiashi Feng, Hengshuang Zhao), Apache-2.0. Unmodified FP16 ONNX
+  export from https://huggingface.co/onnx-community/depth-anything-v2-small
+  (`onnx/model_fp16.onnx`), shipped as `models/depth-anything-v2-small-fp16.onnx`.
+- YuNet face detector (Shiqi Yu et al., OpenCV Zoo), MIT. Unmodified
+  `face_detection_yunet_2023mar.onnx` from
+  https://github.com/opencv/opencv_zoo/tree/main/models/face_detection_yunet.
+
+SHA-256 checksums are recorded in `models/scoring.json` and verified before use.
+
 ## Bundled diagnostics UI
 
 - React 19.2.0, ReactDOM 19.2.0 and Scheduler 0.27.0 — MIT. License:

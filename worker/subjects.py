@@ -5,6 +5,8 @@ Coordinates for selection use the centered 16:9 live view; instance masks keep
 their source-image coordinates so native photo masking is never a bbox crop.
 """
 import io
+import sys
+import threading
 import time
 import uuid
 
@@ -75,9 +77,93 @@ class PersonDetector:
         return people
 
 
+def _session(model, threads):
+    import onnxruntime as ort
+    options = ort.SessionOptions()
+    options.intra_op_num_threads = max(1, min(2, threads)); options.inter_op_num_threads = 1
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    return ort.InferenceSession(str(model), sess_options=options, providers=["CPUExecutionProvider"])
+
+
+class SceneScorer:
+    """Relative depth (Depth Anything V2 Small) and frontal faces (YuNet), both ONNX on CPU.
+
+    The depth map is relative: larger values are closer. Nothing is stored beyond the latest frame."""
+
+    def __init__(self, depth_model, face_model, threads=2):
+        self.depth = _session(depth_model, threads); self.depth_input = self.depth.get_inputs()[0]
+        self.face = _session(face_model, threads); self.face_outputs = [v.name for v in self.face.get_outputs()]
+
+    def depth_map(self, image, edge):
+        w, h = image.size; ratio = edge / max(w, h)
+        nw, nh = max(14, round(w * ratio / 14) * 14), max(14, round(h * ratio / 14) * 14)
+        x = np.asarray(image.resize((nw, nh), Image.Resampling.BICUBIC), dtype=np.float32) / 255
+        x = ((x - (.485, .456, .406)) / (.229, .224, .225)).transpose(2, 0, 1)[None]
+        x = x.astype(np.float16 if "float16" in self.depth_input.type else np.float32)
+        depth = np.asarray(self.depth.run(None, {self.depth_input.name: x})[0], dtype=np.float32).squeeze()
+        return depth
+
+    def faces(self, image):
+        w, h = image.size; scale = min(640 / w, 640 / h)
+        sample = Image.new("RGB", (640, 640))
+        sample.paste(image.resize((max(1, round(w * scale)), max(1, round(h * scale))), Image.Resampling.BILINEAR), (0, 0))
+        tensor = np.asarray(sample, dtype=np.float32)[:, :, ::-1].transpose(2, 0, 1)[None].copy()
+        values = dict(zip(self.face_outputs, self.face.run(None, {"input": tensor})))
+        found = []
+        for stride in (8, 16, 32):
+            scores = np.sqrt(np.clip(values[f"cls_{stride}"][0, :, 0], 0, 1) * np.clip(values[f"obj_{stride}"][0, :, 0], 0, 1))
+            for index in np.flatnonzero(scores >= .6):
+                cy, cx = divmod(int(index), 640 // stride)
+                dx, dy, dw, dh = values[f"bbox_{stride}"][0, index]
+                fw, fh = np.exp(dw) * stride / scale, np.exp(dh) * stride / scale
+                fx, fy = (cx + dx) * stride / scale, (cy + dy) * stride / scale
+                points = values[f"kps_{stride}"][0, index].reshape(5, 2)
+                points = (points + (cx, cy)) * stride / scale
+                right_eye, left_eye, nose = points[0], points[1], points[2]
+                yaw = abs(nose[0] - (right_eye[0] + left_eye[0]) / 2) / max(1., float(np.linalg.norm(left_eye - right_eye)))
+                found.append((float(scores[index]), np.array([fx - fw / 2, fy - fh / 2, fx + fw / 2, fy + fh / 2]), float(np.clip(1 - yaw / .45, 0, 1))))
+        selected = []
+        for item in sorted(found, key=lambda item: -item[0]):
+            if all(overlap(item[1], other[1]) < .3 for other in selected): selected.append(item)
+        return [{"box": box, "facing": score * frontal} for score, box, frontal in selected]
+
+    def observe(self, image, edge):
+        return {"depth": self.depth_map(image, edge), "faces": self.faces(image), "size": image.size}
+
+
+def score_people(people, scene, image_size):
+    """Score 0-100 per person: 50% closeness to the nearest person, 30% facing the camera, 20% height."""
+    w, h = image_size
+    view_w, view_h = min(w, h * 16 / 9), min(h, w * 9 / 16); ox, oy = (w - view_w) / 2, (h - view_h) / 2
+    faces = [((f["box"] - [ox, oy, ox, oy]) / [view_w, view_h, view_w, view_h], f["facing"]) for f in scene["faces"]]
+    depth = scene["depth"]
+    for person in people:
+        grid = person["mask"]
+        resized = np.asarray(Image.fromarray(depth).resize((grid.shape[1], grid.shape[0]), Image.Resampling.BILINEAR))
+        core = np.asarray(Image.fromarray(grid.astype(np.uint8) * 255).filter(ImageFilter.MinFilter(3))) > 0
+        person["depth"] = float(np.median(resized[core if core.sum() >= 12 else grid]))
+        x1, y1, x2, y2 = person["box"]; top = y1 + .45 * (y2 - y1)
+        mine = [(facing, box[3] - box[1]) for box, facing in faces if x1 <= (box[0] + box[2]) / 2 <= x2 and y1 - .02 <= (box[1] + box[3]) / 2 <= top]
+        person["facing"], person["head"] = max(mine, default=(None, None))
+    if not people: return people
+    nearest = max(max(p["depth"] for p in people), 1e-6); tallest = max(max(p["box"][3] - p["box"][1] for p in people), 1e-6)
+    biggest_head = max((p["head"] for p in people if p["head"]), default=None)
+    for person in people:
+        # Depth is only relative (unknown offset), so it is blended with head
+        # size, which shrinks in proportion to real distance.
+        close = float(np.clip((person["depth"] / nearest - .45) / .35, 0, 1))
+        if person["head"]: close = (close + float(np.clip((person["head"] / biggest_head - .55) / .30, 0, 1))) / 2
+        facing = .3 if person["facing"] is None else person["facing"]
+        size = float(np.clip(((person["box"][3] - person["box"][1]) / tallest - .45) / .40, 0, 1))
+        person["subjectScore"] = round(100 * (.5 * close + .3 * facing + .2 * size))
+    return people
+
+
 class SubjectSelector:
-    def __init__(self, detector, clock=time.monotonic):
-        self.detector = detector; self.clock = clock
+    def __init__(self, detector, clock=time.monotonic, scorer=None, background=True):
+        self.detector = detector; self.clock = clock; self.scorer = scorer; self.background = background
+        self.scene = None; self.scene_at = -1e9; self.scene_job = None; self.scene_lock = threading.Lock()
         self.reset()
 
     def reset(self):
@@ -88,6 +174,7 @@ class SubjectSelector:
 
     def configure(self, policy):
         self.reset(); self.policy = policy
+        with self.scene_lock: self.scene = None; self.scene_at = -1e9
 
     def lock(self):
         if not self.state["ready"] or self.clock() - self.last_at > .5:
@@ -132,7 +219,82 @@ class SubjectSelector:
                     matches[self.next_id] = person; self.next_id += 1
         return matches, ambiguous
 
+    def live_scene(self, image):
+        # Depth and faces lag the live frame by up to ~0.3 s; they are looked up
+        # by position, so people from the current frame need no track matching.
+        with self.scene_lock:
+            busy = self.scene_job is not None and self.scene_job.is_alive()
+            stale = self.clock() - self.scene_at
+        if not busy and stale >= .3:
+            sample = image.copy(); policy = self.policy
+            def observe():
+                try: scene = self.scorer.observe(sample, 308)
+                except Exception as error:
+                    print(f"subject scene failed: {error}", file=sys.stderr, flush=True); scene = None
+                with self.scene_lock:
+                    if self.policy is policy: self.scene = scene; self.scene_at = self.clock()
+            if self.background:
+                self.scene_job = threading.Thread(target=observe, daemon=True); self.scene_job.start()
+            else: observe()
+        with self.scene_lock:
+            if self.scene is None or self.scene["size"] != image.size or self.clock() - self.scene_at > 2: return None
+            return self.scene
+
+    @staticmethod
+    def score_support(kept, dropped, scene):
+        union = np.logical_or.reduce([p["mask"] for p in kept])
+        depth = np.asarray(Image.fromarray(scene["depth"]).resize((union.shape[1], union.shape[0]), Image.Resampling.BILINEAR))
+        # Per-pixel depth keeps hair, hands and held props the coarse instance
+        # mask misses, but only close to a kept person and in front of the depth
+        # of anyone removed.
+        farthest_kept = min(p["depth"] for p in kept); cutoff = farthest_kept * .8
+        behind = [p["depth"] for p in dropped if p["depth"] < farthest_kept]
+        if behind: cutoff = max(cutoff, (max(behind) + farthest_kept) / 2)
+        band = np.asarray(Image.fromarray(union.astype(np.uint8) * 255).filter(ImageFilter.MaxFilter(9))) > 0
+        base = union | (band & (depth >= cutoff))
+        support = Image.fromarray(base.astype(np.uint8) * 255).filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.GaussianBlur(.6))
+        if dropped:
+            # The coarse instance mask misses a removed person's outline; widen it
+            # but never into a kept person's own mask.
+            excluded = np.logical_or.reduce([p["mask"] for p in dropped])
+            excluded = (np.asarray(Image.fromarray(excluded.astype(np.uint8) * 255).filter(ImageFilter.MaxFilter(5))) > 0) & ~union
+            values = np.array(support); values[excluded] = 0; support = Image.fromarray(values)
+        return support
+
+    def evaluate_score(self, image, native, source):
+        now = self.clock()
+        if native and (not self.lock_id or now - self.last_at > 15):
+            raise SubjectBlocked("SUBJECT_LOCK_EXPIRED")
+        people = self.detector.detect(image, native)
+        scene = self.scorer.observe(image, 364) if native else self.live_scene(image)
+        threshold = self.policy.get("threshold", 75); kept = []; dropped = []
+        if scene is not None and people:
+            score_people(people, scene, image.size)
+            # The best-scoring person is always a guest, so a strict threshold
+            # can narrow the group but never empty the photo.
+            best = max(people, key=lambda p: p["subjectScore"])
+            kept = [p for p in people if p is best or p["subjectScore"] >= threshold]
+            dropped = [p for p in people if all(p is not k for k in kept)]
+        scores = sorted((p["subjectScore"] for p in people if "subjectScore" in p), reverse=True)[:24]
+        if not native:
+            reason = None
+            if not kept: reason = "select"
+            elif len(kept) > self.policy["maxPeople"]: reason = "too_many"
+            if reason or (self.last_at and now - self.last_at > .5): self.stable_since = None
+            if reason is None and self.stable_since is None: self.stable_since = now
+            ready = reason is None and (now - self.stable_since) * 1000 >= self.policy["stableMs"]
+            self.last_at = now; self.last_source = source
+            self.state = {"ready": ready, "reason": reason or ("ready" if ready else "stabilizing"), "count": len(kept), "locked": bool(self.lock_id), "lockId": self.lock_id, "mode": "score"}
+        # A native still is never blocked by scoring: with nobody found the
+        # RVM matte is kept whole rather than cancelling the capture.
+        support = self.score_support(kept, dropped, scene) if kept else None
+        metadata = {**self.state, "verifiedNative": native, "count": len(kept), "threshold": threshold, "scores": scores, "selectionApplied": support is not None}
+        return support, metadata
+
     def evaluate(self, image, native=False, source=None):
+        if self.policy["mode"] == "score":
+            if self.scorer is None: raise SubjectBlocked("SUBJECT_MODEL_UNAVAILABLE")
+            return self.evaluate_score(image, native, source)
         if self.policy["mode"] == "all":
             now = self.clock()
             # Retain the frame/capture lease without selecting or filtering people.

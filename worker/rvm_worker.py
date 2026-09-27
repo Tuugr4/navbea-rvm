@@ -531,6 +531,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=os.environ.get("RVM_MODEL_PATH", ""))
     parser.add_argument("--subject-model", default="")
+    parser.add_argument("--depth-model", default="")
+    parser.add_argument("--face-model", default="")
     parser.add_argument("--device", choices=("auto", "cuda", "directml", "cpu"), default=os.environ.get("RVM_DEVICE", "auto"))
     parser.add_argument("--downsample-ratio", type=float, default=0.375)
     parser.add_argument("--still-ratio", type=float, default=0.5)
@@ -588,9 +590,11 @@ def main() -> int:
         engine.still_deadline_ms = args.still_deadline_ms
     selector = None
     if args.subject_model:
-        from subjects import PersonDetector, SubjectSelector
-        selector = SubjectSelector(PersonDetector(args.subject_model, args.threads or 2))
+        from subjects import PersonDetector, SceneScorer, SubjectSelector
+        scorer = SceneScorer(args.depth_model, args.face_model, args.threads or 2) if args.depth_model and args.face_model else None
+        selector = SubjectSelector(PersonDetector(args.subject_model, args.threads or 2), scorer=scorer)
         selector.detector.detect(Image.new("RGB", (128, 128)))
+        if scorer: scorer.observe(Image.new("RGB", (128, 72)), 252)
     print(json.dumps({"event": "rvm-ready", "protocol": 1, "startupId": args.startup_id,
                       "inferenceVerified": not args.fixture, "provider": getattr(engine, "primary_provider", args.device)}), file=sys.stderr, flush=True)
     if args.check_runtime: return 0
