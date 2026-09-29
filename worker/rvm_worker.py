@@ -65,6 +65,31 @@ def select_onnx_providers(available: list[str], device_mode: str) -> list[str]:
     return ["CPUExecutionProvider"]
 
 
+def gpu_devices(ort) -> list[dict]:
+    """Execution devices as onnxruntime reports them (name, discrete, video memory)."""
+    devices = []
+    try:
+        for device in ort.get_ep_devices():
+            metadata = dict(device.device.metadata)
+            devices.append({"provider": device.ep_name, "name": metadata.get("Description", ""), "discrete": metadata.get("Discrete") == "1",
+                            "videoMemory": metadata.get("DxgiVideoMemory"), "adapter": metadata.get("DxgiAdapterNumber"), "highPerformanceIndex": metadata.get("DxgiHighPerformanceIndex")})
+    except Exception:
+        pass
+    return devices
+
+
+def dml_adapter(ort) -> tuple[int, str]:
+    """DirectML's default adapter 0 is the integrated GPU on hybrid systems; use the high-performance one."""
+    for device in gpu_devices(ort):
+        if device["provider"] == "DmlExecutionProvider" and device["highPerformanceIndex"] == "0":
+            return int(device["adapter"] or 0), device["name"]
+    return 0, ""
+
+
+def with_adapter(ort, providers: list[str]) -> list:
+    return [("DmlExecutionProvider", {"device_id": dml_adapter(ort)[0]}) if name == "DmlExecutionProvider" else name for name in providers]
+
+
 def read_exact(stream, length: int) -> bytes:
     chunks: list[bytes] = []
     remaining = length
@@ -153,7 +178,7 @@ class RvmEngine:
 
 
 class OnnxRvmEngine:
-    def __init__(self, model_path: Path, device_mode: str = "auto", downsample_ratio: float = 0.375, still_ratio: float = 0.5, threads: int = 0, still_max_edge: int = 1024, still_threads: int = 0, still_warmup: int = 4, still_rvm_model: Path | None = None):
+    def __init__(self, model_path: Path, device_mode: str = "auto", downsample_ratio: float = 0.375, still_ratio: float = 0.5, threads: int = 0, still_max_edge: int = 1024, still_threads: int = 0, still_warmup: int = 4, still_rvm_model: Path | None = None, native_device: str = "cpu"):
         import numpy as np
         import onnxruntime as ort
         from PIL import Image
@@ -174,7 +199,7 @@ class OnnxRvmEngine:
         self.run_options = ort.RunOptions()
         self.run_options.only_execute_path_to_fetches = True
         try:
-            self.session = ort.InferenceSession(self.model_path, sess_options=self.session_options, providers=providers)
+            self.session = ort.InferenceSession(self.model_path, sess_options=self.session_options, providers=with_adapter(ort, providers))
         except Exception:
             if device_mode != "auto" or providers[0] == "CPUExecutionProvider":
                 raise
@@ -195,6 +220,10 @@ class OnnxRvmEngine:
         self.native_model_path = str(still_rvm_model) if still_rvm_model else self.model_path
         self.native_model_name = Path(still_rvm_model).stem if still_rvm_model else None
         self.native_input_types = self.input_types
+        # "auto": the native pass follows the live session onto CUDA/DirectML. DirectML cannot expand the 1x1
+        # recurrent placeholder, so the first warm-up step is seeded on the CPU; any GPU failure moves photos to CPU.
+        self.native_gpu = native_device == "auto" and self.primary_provider in ("CUDAExecutionProvider", "DmlExecutionProvider")
+        self.native_seed = None
         self.still_threads = still_threads or self.session_options.intra_op_num_threads
         self.downsample_ratio = np.asarray([downsample_ratio], dtype=np.float32)
         self.still_ratio = np.asarray([still_ratio], dtype=np.float32)
@@ -215,7 +244,7 @@ class OnnxRvmEngine:
         self.rec = [self.np.zeros((1, 1, 1, 1), dtype=self.tensor_dtype) for _ in range(4)]
         self.rec_initialized = False
         self.foreground_jpeg = None
-        if self.native_session is not None:
+        if self.native_session is not None and not self.native_gpu:
             # Run a tiny empty-person probe after native outputs have been
             # consumed. Shrink only the native arena, leaving live latency and
             # loaded model weights intact between people.
@@ -232,6 +261,17 @@ class OnnxRvmEngine:
     def _native(self):
         if self.primary_provider == "CUDAExecutionProvider" and self.native_model_name is None:
             return self.session
+        if self.native_session is None and self.native_gpu:
+            options = self.ort.SessionOptions()
+            options.intra_op_num_threads = self.still_threads
+            options.inter_op_num_threads = 1
+            options.enable_mem_pattern = False
+            options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+            providers = with_adapter(self.ort, [self.primary_provider, "CPUExecutionProvider"])
+            self.native_session = self.ort.InferenceSession(self.native_model_path, sess_options=options, providers=providers)
+            self.native_input_types = {item.name: item.type for item in self.native_session.get_inputs()}
+            if self.primary_provider == "DmlExecutionProvider":
+                self.native_seed = self.ort.InferenceSession(self.native_model_path, sess_options=self.session_options, providers=["CPUExecutionProvider"])
         if self.native_session is None:
             register_native_allocator(self.ort)
             options = self.ort.SessionOptions()
@@ -262,7 +302,7 @@ class OnnxRvmEngine:
         """Recurrent state for a native still: the photo at the encoder's working
         size, run at ratio 1 so the state matches the full-resolution pass."""
         rec = [self.np.zeros((1, 1, 1, 1), dtype=self.tensor_dtype) for _ in range(4)]
-        if not self.still_warmup:
+        if not self.still_warmup and self.native_seed is None:
             return rec
         height, width = rgb.shape[:2]
         size = (max(1, int(width * float(ratio[0]))), max(1, int(height * float(ratio[0]))))
@@ -271,9 +311,23 @@ class OnnxRvmEngine:
         src[0] = small.transpose(2, 0, 1)
         src *= 1.0 / 255.0
         one = self.np.asarray([1.0], dtype=self.np.float32)
-        for _ in range(self.still_warmup):
+        steps = self.still_warmup
+        if self.native_seed is not None and session is self.native_session:
+            rec = self.native_seed.run(["r1o", "r2o", "r3o", "r4o"], self._feeds(src, rec, one, self.native_input_types), self.run_options)
+            steps -= 1
+        for _ in range(steps):
             rec = session.run(["r1o", "r2o", "r3o", "r4o"], self._feeds(src, rec, one, self._types(session)), self.run_options)
         return rec
+
+    def _native_on_cpu(self, error):
+        """A GPU photo pass failed: this and every later photo run on the CPU."""
+        self.native_gpu = False; self.native_session = None; self.native_seed = None
+        print(json.dumps({"event": "provider-change", "scope": "photo", "provider": "CPUExecutionProvider", "reason": f"GPU photo pass failed: {str(error)[:160]}"}), file=sys.stderr, flush=True)
+        return self._native()
+
+    def native_provider(self):
+        if self.native_gpu: return self.primary_provider
+        return "CUDAExecutionProvider" if self.primary_provider == "CUDAExecutionProvider" and self.native_model_name is None else "CPUExecutionProvider"
 
     def _types(self, session):
         return self.native_input_types if session is self.native_session else self.input_types
@@ -338,18 +392,26 @@ class OnnxRvmEngine:
         if native:
             started = time.perf_counter()
             job = self.still_engine.start(rgb) if self.still_engine else None
-            # Keep the fast DirectML live session intact. Native stills use their
-            # own CPU recurrence so their different resolution cannot crash
-            # the DirectML Expand nodes.
-            session = self._native()
+            # Keep the fast live session intact. Native stills use their own
+            # session (CPU, or the GPU with a CPU-seeded recurrence) so their
+            # different resolution cannot crash the DirectML Expand nodes.
+            try:
+                session = self._native()
+            except Exception as error:
+                session = self._native_on_cpu(error)
             ratio = self.np.asarray([min(float(self.still_ratio[0]), self.still_max_edge / max(width, height))], dtype=self.np.float32) if self.still_max_edge else self.still_ratio
             try:
                 outputs = self._run(session, src, self._warm_still(session, rgb, ratio), ratio)
             except Exception as error:
-                if not self.still_warmup:
+                if self.native_gpu:
+                    # The GPU pass failed: this photo is redone on the CPU.
+                    session = self._native_on_cpu(error)
+                    outputs = self._run(session, src, self._warm_still(session, rgb, ratio), ratio)
+                elif not self.still_warmup:
                     raise
-                print(json.dumps({"event": "still-warmup-skipped", "error": str(error)[:200]}), file=sys.stderr, flush=True)
-                outputs = self._run(session, src, [self.np.zeros((1, 1, 1, 1), dtype=self.tensor_dtype) for _ in range(4)], ratio)
+                else:
+                    print(json.dumps({"event": "still-warmup-skipped", "error": str(error)[:200]}), file=sys.stderr, flush=True)
+                    outputs = self._run(session, src, [self.np.zeros((1, 1, 1, 1), dtype=self.tensor_dtype) for _ in range(4)], ratio)
             del src
             if self.native_model_name is not None:
                 self.last_still = {"model": self.native_model_name, "provider": session.get_providers()[0], "used": self.native_model_name, "totalMs": round((time.perf_counter() - started) * 1000)}
@@ -551,6 +613,7 @@ def main() -> int:
     parser.add_argument("--still-warmup", type=int, choices=range(0, 9), default=4)
     parser.add_argument("--still-model", default="")
     parser.add_argument("--still-rvm-model", default="")
+    parser.add_argument("--native-device", choices=("cpu", "auto"), default="cpu")
     parser.add_argument("--still-device", choices=("auto", "cuda", "directml", "cpu"), default="auto")
     parser.add_argument("--still-deadline-ms", type=int, default=5000)
     parser.add_argument("--check-still-model", action="store_true")
@@ -563,7 +626,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.inspect_runtime:
         import onnxruntime as ort
-        print(json.dumps({"providers":ort.get_available_providers(),"onnxruntime":ort.__version__}))
+        print(json.dumps({"providers":ort.get_available_providers(),"onnxruntime":ort.__version__,"devices":gpu_devices(ort),"dmlAdapter":dml_adapter(ort)[1] if "DmlExecutionProvider" in ort.get_available_providers() else None}))
         return 0
     if not 0 < args.downsample_ratio <= 1 or not 0 < args.still_ratio <= 1 or not 0 <= args.threads <= (os.cpu_count() or 1) or not 0 <= args.still_threads <= (os.cpu_count() or 1):
         parser.error("Ratios must be in (0, 1]; threads must be 0 (automatic) or an available processor count")
@@ -573,7 +636,7 @@ def main() -> int:
     if args.check_still_model:
         return check_still_model(Path(args.still_model).resolve(), args.still_device, args.threads)
     model_path = Path(args.model).resolve()
-    engine = FixtureEngine() if args.fixture else OnnxRvmEngine(model_path, args.device, args.downsample_ratio, args.still_ratio, args.threads, args.still_max_edge, args.still_threads, args.still_warmup, Path(args.still_rvm_model).resolve() if args.still_rvm_model else None) if model_path.suffix.lower() == ".onnx" else RvmEngine(model_path, args.device, args.downsample_ratio)
+    engine = FixtureEngine() if args.fixture else OnnxRvmEngine(model_path, args.device, args.downsample_ratio, args.still_ratio, args.threads, args.still_max_edge, args.still_threads, args.still_warmup, Path(args.still_rvm_model).resolve() if args.still_rvm_model else None, args.native_device) if model_path.suffix.lower() == ".onnx" else RvmEngine(model_path, args.device, args.downsample_ratio)
     if not args.fixture:
         from PIL import Image
         sample = io.BytesIO()
@@ -582,6 +645,10 @@ def main() -> int:
         if width != 128 or height != 128 or len(mask) != width * height:
             raise RuntimeError("RVM startup inference returned invalid dimensions")
         engine.reset()
+        if isinstance(engine, OnnxRvmEngine) and engine.native_gpu:
+            # Compile and verify the GPU photo pass now, not on the first customer photo.
+            sample = io.BytesIO(); Image.new("RGB", (320, 180), (80, 100, 120)).save(sample, format="JPEG")
+            engine.process(sample.getvalue(), native=True); engine.reset()
         if args.check_model:
             started = time.perf_counter()
             sample = io.BytesIO()
@@ -605,8 +672,11 @@ def main() -> int:
         selector = SubjectSelector(PersonDetector(args.subject_model, args.threads or 2), scorer=scorer)
         selector.detector.detect(Image.new("RGB", (128, 128)))
         if scorer: scorer.observe(Image.new("RGB", (128, 72)), 252)
+    import onnxruntime as _ort
     print(json.dumps({"event": "rvm-ready", "protocol": 1, "startupId": args.startup_id,
-                      "inferenceVerified": not args.fixture, "provider": getattr(engine, "primary_provider", args.device)}), file=sys.stderr, flush=True)
+                      "inferenceVerified": not args.fixture, "provider": getattr(engine, "primary_provider", args.device),
+                      "photoProvider": engine.native_provider() if isinstance(engine, OnnxRvmEngine) else None,
+                      "adapter": dml_adapter(_ort)[1] if getattr(engine, "primary_provider", "") == "DmlExecutionProvider" else None}), file=sys.stderr, flush=True)
     if args.check_runtime: return 0
     return serve(engine, selector=selector)
 

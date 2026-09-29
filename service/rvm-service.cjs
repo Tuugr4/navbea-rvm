@@ -73,6 +73,7 @@ class PythonWorker {
     if (this.options.subjectModel) args.push("--subject-model", this.options.subjectModel);
     if (this.options.depthModel && this.options.faceModel) args.push("--depth-model", this.options.depthModel, "--face-model", this.options.faceModel);
     if (this.options.stillRvmModel) args.push("--still-rvm-model", this.options.stillRvmModel);
+    args.push("--native-device", this.options.nativeDevice || "cpu");
     if (this.options.stillModel) args.push("--still-model", this.options.stillModel, "--still-device", this.options.stillDevice || "auto", "--still-deadline-ms", String(this.options.stillDeadlineMs ?? 5000));
     this.child = spawn(this.options.python, args, { windowsHide: true, shell: false, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PYTHONUNBUFFERED: "1" } });
     this.child.stdout.on("data", chunk => {
@@ -109,10 +110,10 @@ class PythonWorker {
           const line = diagnostic.slice(0, newline); diagnostic = diagnostic.slice(newline + 1);
           try {
             const event = JSON.parse(line);
-            if(event.event==='provider-change'&&typeof event.provider==='string'){this.actualProvider=event.provider;this.onProvider?.(event.provider,event.reason);}
+            if(event.event==='provider-change'&&typeof event.provider==='string'){if(event.scope==='photo')this.onPhotoProvider?.(event.provider,event.reason);else{this.actualProvider=event.provider;this.onProvider?.(event.provider,event.reason);}}
             if(typeof event.event==='string'&&event.event.startsWith('still-matte'))this.onStillMatte?.(event);
             if (!settled && event.event === "rvm-ready" && event.protocol === 1 && event.startupId === startupId && event.inferenceVerified === true) {
-              this.actualProvider=event.provider;this.onProvider?.(event.provider);
+              this.actualProvider=event.provider;this.onProvider?.(event.provider);this.onReady?.(event);
               settled = true; clearTimeout(timer); resolve();
             }
           } catch { /* Non-protocol Python diagnostics are logged separately. */ }
@@ -202,7 +203,7 @@ class RvmService {
     const selected=this.models?.active;
     const model = selected ? this.models.file(this.models.entry(selected.id)) : this.env.RVM_MODEL_PATH || first([path.join(packagedRoot, "models", "rvm_mobilenetv3_fp32.onnx"), path.join(packagedRoot, "rvm_mobilenetv3_fp32.onnx"), path.join(packagedRoot, "models", "rvm_mobilenetv3_fp32.torchscript"), path.join(packagedRoot, "rvm_mobilenetv3_fp32.torchscript")]);
     const still=this.stillModels?.active&&this.stillModels.entry(this.stillModels.active.id);
-    return { python, script: path.join(packagedRoot, "worker", "rvm_worker.py"), model, stillModel: still&&!still.builtin&&still.architecture!=="rvm"?this.stillModels.file(still):"", stillRvmModel: still&&!still.builtin&&still.architecture==="rvm"?this.stillModels.file(still):"", stillDevice: this.env.RVM_STILL_DEVICE || "auto", stillDeadlineMs: this.stillDeadlineMs(), device: selected&&selected.id!==this.models.catalogue.defaultModel?selected.device:this.env.RVM_DEVICE || "cpu", liveRatio: Number(this.env.RVM_LIVE_RATIO || 0.375), stillRatio: Number(this.env.RVM_STILL_RATIO || 0.5), stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), threads: this.env.RVM_CPU_THREADS || "auto", cpuBudget: this.env.RVM_CPU_BUDGET || "auto", logPath: path.join(this.dataRoot, "worker.log"), debugDir: this.env.RVM_DEBUG_FRAME_DIR || "" };
+    return { python, script: path.join(packagedRoot, "worker", "rvm_worker.py"), model, stillModel: still&&!still.builtin&&still.architecture!=="rvm"?this.stillModels.file(still):"", stillRvmModel: still&&!still.builtin&&still.architecture==="rvm"?this.stillModels.file(still):"", stillDevice: this.deviceMode==="cpu"?"cpu":this.env.RVM_STILL_DEVICE || "auto", stillDeadlineMs: this.stillDeadlineMs(), device: this.deviceMode?(this.deviceMode==="cpu"?"cpu":"auto"):selected&&selected.id!==this.models.catalogue.defaultModel?selected.device:this.env.RVM_DEVICE || "cpu", nativeDevice: this.deviceMode&&this.deviceMode!=="cpu"?"auto":"cpu", liveRatio: Number(this.env.RVM_LIVE_RATIO || 0.375), stillRatio: Number(this.env.RVM_STILL_RATIO || 0.5), stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), threads: this.env.RVM_CPU_THREADS || "auto", cpuBudget: this.env.RVM_CPU_BUDGET || "auto", logPath: path.join(this.dataRoot, "worker.log"), debugDir: this.env.RVM_DEBUG_FRAME_DIR || "" };
   }
   stillDeadlineMs() { const value = Number(this.env.RVM_STILL_DEADLINE_MS || 5000); return Number.isInteger(value) && value >= 500 && value <= 30000 ? value : 5000; }
   ensureWorker() {
@@ -254,6 +255,8 @@ class RvmService {
     this.worker = new PythonWorker(options);
     const worker = this.worker;
     worker.onProvider=(provider,reason)=>{if(this.worker!==worker)return;this.metrics.device=provider;this.metrics.providerFallback=reason||null;};
+    worker.onPhotoProvider=(provider,reason)=>{if(this.worker!==worker)return;this.metrics.photoProvider=provider;this.metrics.photoFallback=reason||null;};
+    worker.onReady=event=>{if(this.worker!==worker)return;this.metrics.photoProvider=event.photoProvider||null;this.metrics.adapter=event.adapter||null;this.metrics.photoFallback=null;};
     const stillId=options.stillModel||options.stillRvmModel?this.stillModels.active.id:null;
     // A larger RVM for photos runs as the native pass itself: nothing loads in the background.
     this.metrics.stillModel=stillId?(options.stillRvmModel?{id:stillId,status:'ready',provider:'CPUExecutionProvider',warmupMs:0}:{id:stillId,status:'loading'}):null;
@@ -387,6 +390,36 @@ class RvmService {
       try{await this.startWorker();}
       catch(error){await this.models.restore(previous,'Yeni model başlatılamadı; önceki model geri yüklendi. '+error.message);this.worker?.stop();this.worker=null;this.workerProfile=null;await this.startWorker();throw error;}
       return this.modelsStatus();
+    }finally{this.modelChange=false;}
+  });}
+  // Processing unit (Otomatik / Ekran kartı / İşlemci) for the live mask and the photo mask, with the hardware it runs on.
+  async loadDeviceMode(){try{const saved=JSON.parse(await fsp.readFile(path.join(this.dataRoot,'device-selection.json'),'utf8'));this.deviceMode=['auto','gpu','cpu'].includes(saved.mode)?saved.mode:null;}catch{this.deviceMode=null;}}
+  async saveDeviceMode(mode){const file=path.join(this.dataRoot,'device-selection.json'),temporary=file+'.'+crypto.randomUUID()+'.tmp';try{await fsp.writeFile(temporary,JSON.stringify({mode}),{mode:0o600,flag:'wx'});await fsp.rename(temporary,file);}finally{await fsp.unlink(temporary).catch(()=>{});}this.deviceMode=mode;}
+  inventory(){
+    if(!this.inventoryPromise)this.inventoryPromise=new Promise(resolve=>{const options=this.workerOptions();execFile(options.python,['-I','-B',options.script,'--inspect-runtime'],{windowsHide:true,timeout:60000,maxBuffer:1024*1024},(error,stdout)=>{try{resolve(error?null:JSON.parse(stdout.trim().split(/\r?\n/).at(-1)));}catch{resolve(null);}});});
+    return this.inventoryPromise;
+  }
+  async deviceStatus(){
+    const runtime=this.fixture?null:await this.inventory();const cpus=os.cpus();
+    const gpus=(runtime?.devices||[]).filter(item=>['CUDAExecutionProvider','DmlExecutionProvider'].includes(item.provider)).map(item=>({name:item.name,discrete:Boolean(item.discrete),videoMemory:item.videoMemory||null,inUse:Boolean(this.metrics.adapter)&&item.name===this.metrics.adapter}));
+    const unique=[...new Map(gpus.map(item=>[item.name,item])).values()];
+    const live=this.metrics.device&&this.metrics.device!=='auto'?this.metrics.device:null;
+    return {available:!this.fixture,mode:this.deviceMode||(live&&live!=='CPUExecutionProvider'?'auto':'cpu'),explicit:Boolean(this.deviceMode),gpuAvailable:(runtime?.providers||[]).some(item=>['CUDAExecutionProvider','DmlExecutionProvider'].includes(item)),
+      hardware:{cpu:{name:cpus[0]?.model?.trim()||null,logical:cpus.length,physical:this.metrics.physicalCores??null},memoryGiB:Math.round(os.totalmem()/1073741824),gpus:unique},
+      running:{live,photo:this.metrics.photoProvider||null,adapter:this.metrics.adapter||null,photoFallback:this.metrics.photoFallback||null,liveFallback:this.metrics.providerFallback||null},
+      switching:Boolean(this.modelChange),activeSessions:this.sessions.size};
+  }
+  changeDevice(mode){return this.lifecycle(async()=>{
+    if(!['auto','gpu','cpu'].includes(mode))throw Error('Geçersiz işlem birimi.');
+    if(this.preview.active)throw Error('İşlem birimini değiştirmek için canlı önizlemeyi kapatın.');
+    if(this.sessions.size||this.stillTask||this.resetPromise||this.workerStartPromise)throw Error('İşlem birimini değiştirmek için aktif çekim oturumunun bitmesini bekleyin.');
+    const previous=this.deviceMode;this.modelChange=true;
+    const restart=async()=>{this.worker?.stop();this.worker=null;this.workerProfile=null;this.workerRestarts=0;await this.startWorker();};
+    try{
+      await this.saveDeviceMode(mode);
+      try{await restart();if(mode==='gpu'&&this.metrics.device==='CPUExecutionProvider')throw Error('Ekran kartı başlatılamadı; bu bilgisayarda uyumlu bir GPU sürücüsü bulunamadı.');}
+      catch(error){if(previous)await this.saveDeviceMode(previous);else{await fsp.unlink(path.join(this.dataRoot,'device-selection.json')).catch(()=>{});this.deviceMode=null;}await restart().catch(()=>{});throw Error(error.message+' Önceki ayar geri yüklendi.');}
+      return this.deviceStatus();
     }finally{this.modelChange=false;}
   });}
   stillModelsStatus(){if(this.modelsInitializing)return{available:false,error:'Modeller kontrol ediliyor.'};if(!this.stillModels)return{available:false,error:this.stillModelError||'Fotoğraf maskesi modelleri hazır değil.'};const status=this.stillModels.snapshot();const activeId=this.loadedStillModelId||status.active.id;return {...status,available:true,active:{...status.active,id:activeId},models:status.models.map(item=>({...item,active:item.id===activeId})),switching:Boolean(this.modelChange)||status.switching,activeSessions:this.sessions.size,deadlineMs:this.stillDeadlineMs(),runtime:this.metrics.stillModel||null,lastStillMatte:this.metrics.lastStillMatte||null};}
@@ -605,6 +638,11 @@ class RvmService {
         return json(res,200,url.pathname.endsWith('/download')?this.models.startDownload(body.id):url.pathname.endsWith('/cancel')?this.models.cancelDownload():await this.changeModel(body.id));
       }
       if(req.method==='GET'&&url.pathname==='/v1/still-models')return json(res,200,this.stillModelsStatus());
+      if(req.method==='GET'&&url.pathname==='/v1/device')return json(res,200,await this.deviceStatus());
+      if(req.method==='POST'&&url.pathname==='/v1/device/activate'){
+        if(!this.authorized(req,'admin'))return json(res,403,{error:'İşlem birimi seçimi için yönetici izni gerekiyor.'});
+        return json(res,200,await this.changeDevice((await readJson(req)).id));
+      }
       if(req.method==='POST'&&['/v1/still-models/download','/v1/still-models/cancel','/v1/still-models/activate'].includes(url.pathname)){
         if(!this.authorized(req,'admin'))return json(res,403,{error:'Model yönetimi için yönetici izni gerekiyor.'});
         if(!this.stillModels||this.modelsInitializing)throw Error('Fotoğraf maskesi modelleri hazır değil.');
@@ -658,6 +696,7 @@ class RvmService {
   async start() {
     try {
       await this.ensureStorage();
+      await this.loadDeviceMode();
       this.controlServer = http.createServer((req, res) => void this.handleControl(req, res)); this.streamServer = net.createServer(socket => this.handleStream(socket));
       await this.listen(this.controlServer, this.paths.control); await this.listen(this.streamServer, this.paths.stream);
       this.modelsInitializing=true;

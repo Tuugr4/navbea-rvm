@@ -55,6 +55,8 @@ let modelAction=null;
 const runModelAction=(event,action,id,kind)=>{requireModelWindow(event);modelController.check(action,id,kind);if(modelAction)throw Error('Model işlemi sürüyor.');modelAction=modelController.administer(modelOptions(),action,id,kind).finally(()=>{modelAction=null;});return modelAction;};
 ipcMain.handle('rvm:model-action',(event,action,id)=>runModelAction(event,action,id,'live'));
 ipcMain.handle('rvm:still-model-action',(event,action,id)=>runModelAction(event,action,id,'still'));
+ipcMain.handle('rvm:device',event=>{requireModelWindow(event);return modelController.request(modelOptions(),'/v1/device');});
+ipcMain.handle('rvm:device-action',(event,id)=>runModelAction(event,'activate',id,'device'));
 ipcMain.handle("rvm:open-source", () => app.getVersion().includes("-local") && app.isPackaged ? shell.openPath(resource("source")) : shell.openExternal("https://github.com/Tuugr4/navbea-rvm/releases/tag/v1.0.4"));
 ipcMain.handle("rvm:open-upstream", () => shell.openExternal("https://github.com/PeterL1n/RobustVideoMatting"));
 ipcMain.handle("rvm:open-license", () => shell.openPath(resource("LICENSE")));

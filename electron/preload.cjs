@@ -5,6 +5,8 @@ contextBridge.exposeInMainWorld("rvm", {
   modelAction: (action,id) => ipcRenderer.invoke('rvm:model-action',action,id),
   stillModels: () => ipcRenderer.invoke('rvm:still-models'),
   stillModelAction: (action,id) => ipcRenderer.invoke('rvm:still-model-action',action,id),
+  device: () => ipcRenderer.invoke('rvm:device'),
+  deviceAction: (id) => ipcRenderer.invoke('rvm:device-action',id),
   previewStart: () => ipcRenderer.invoke('rvm:preview-start'),
   previewFrame: () => ipcRenderer.invoke('rvm:preview-frame'),
   previewStop: () => ipcRenderer.invoke('rvm:preview-stop'),
