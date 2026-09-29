@@ -9,7 +9,7 @@ const path = require("node:path");
 const { spawn, execFile } = require("node:child_process");
 const { resolveCpuProfile } = require("./cpu-profile.cjs");
 const { ModelManager } = require('./model-manager.cjs');
-const { runModelProbe, runStillProbe } = require('./model-probe.cjs');
+const { runModelProbe, runStillProbe, runStillRvmProbe } = require('./model-probe.cjs');
 const stillCatalog = require('../models/still-catalog.json');
 const { LivePreview } = require('./live-preview.cjs');
 
@@ -72,6 +72,7 @@ class PythonWorker {
     args.push("--still-threads", String(this.options.stillThreads ?? 0));
     if (this.options.subjectModel) args.push("--subject-model", this.options.subjectModel);
     if (this.options.depthModel && this.options.faceModel) args.push("--depth-model", this.options.depthModel, "--face-model", this.options.faceModel);
+    if (this.options.stillRvmModel) args.push("--still-rvm-model", this.options.stillRvmModel);
     if (this.options.stillModel) args.push("--still-model", this.options.stillModel, "--still-device", this.options.stillDevice || "auto", "--still-deadline-ms", String(this.options.stillDeadlineMs ?? 5000));
     this.child = spawn(this.options.python, args, { windowsHide: true, shell: false, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PYTHONUNBUFFERED: "1" } });
     this.child.stdout.on("data", chunk => {
@@ -201,7 +202,7 @@ class RvmService {
     const selected=this.models?.active;
     const model = selected ? this.models.file(this.models.entry(selected.id)) : this.env.RVM_MODEL_PATH || first([path.join(packagedRoot, "models", "rvm_mobilenetv3_fp32.onnx"), path.join(packagedRoot, "rvm_mobilenetv3_fp32.onnx"), path.join(packagedRoot, "models", "rvm_mobilenetv3_fp32.torchscript"), path.join(packagedRoot, "rvm_mobilenetv3_fp32.torchscript")]);
     const still=this.stillModels?.active&&this.stillModels.entry(this.stillModels.active.id);
-    return { python, script: path.join(packagedRoot, "worker", "rvm_worker.py"), model, stillModel: still&&!still.builtin?this.stillModels.file(still):"", stillDevice: this.env.RVM_STILL_DEVICE || "auto", stillDeadlineMs: this.stillDeadlineMs(), device: selected&&selected.id!==this.models.catalogue.defaultModel?selected.device:this.env.RVM_DEVICE || "cpu", liveRatio: Number(this.env.RVM_LIVE_RATIO || 0.375), stillRatio: Number(this.env.RVM_STILL_RATIO || 0.5), stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), threads: this.env.RVM_CPU_THREADS || "auto", cpuBudget: this.env.RVM_CPU_BUDGET || "auto", logPath: path.join(this.dataRoot, "worker.log"), debugDir: this.env.RVM_DEBUG_FRAME_DIR || "" };
+    return { python, script: path.join(packagedRoot, "worker", "rvm_worker.py"), model, stillModel: still&&!still.builtin&&still.architecture!=="rvm"?this.stillModels.file(still):"", stillRvmModel: still&&!still.builtin&&still.architecture==="rvm"?this.stillModels.file(still):"", stillDevice: this.env.RVM_STILL_DEVICE || "auto", stillDeadlineMs: this.stillDeadlineMs(), device: selected&&selected.id!==this.models.catalogue.defaultModel?selected.device:this.env.RVM_DEVICE || "cpu", liveRatio: Number(this.env.RVM_LIVE_RATIO || 0.375), stillRatio: Number(this.env.RVM_STILL_RATIO || 0.5), stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), threads: this.env.RVM_CPU_THREADS || "auto", cpuBudget: this.env.RVM_CPU_BUDGET || "auto", logPath: path.join(this.dataRoot, "worker.log"), debugDir: this.env.RVM_DEBUG_FRAME_DIR || "" };
   }
   stillDeadlineMs() { const value = Number(this.env.RVM_STILL_DEADLINE_MS || 5000); return Number.isInteger(value) && value >= 500 && value <= 30000 ? value : 5000; }
   ensureWorker() {
@@ -237,7 +238,7 @@ class RvmService {
       }
       if (files.depth && files.face) { options.depthModel = files.depth; options.faceModel = files.face; this.subjectScoringReady = true; }
     }
-    for (const target of [options.python, options.script, options.model, options.stillModel].filter(Boolean)) await fsp.access(target);
+    for (const target of [options.python, options.script, options.model, options.stillModel, options.stillRvmModel].filter(Boolean)) await fsp.access(target);
     this.status = "starting";
     this.metrics.threadMode = "calibrating";
     const profile = this.workerProfile || await resolveCpuProfile(options, this.dataRoot);
@@ -253,8 +254,9 @@ class RvmService {
     this.worker = new PythonWorker(options);
     const worker = this.worker;
     worker.onProvider=(provider,reason)=>{if(this.worker!==worker)return;this.metrics.device=provider;this.metrics.providerFallback=reason||null;};
-    const stillId=options.stillModel?this.stillModels.active.id:null;
-    this.metrics.stillModel=stillId?{id:stillId,status:'loading'}:null;
+    const stillId=options.stillModel||options.stillRvmModel?this.stillModels.active.id:null;
+    // A larger RVM for photos runs as the native pass itself: nothing loads in the background.
+    this.metrics.stillModel=stillId?(options.stillRvmModel?{id:stillId,status:'ready',provider:'CPUExecutionProvider',warmupMs:0}:{id:stillId,status:'loading'}):null;
     worker.onStillMatte=event=>{
       if(this.worker!==worker)return;
       if(event.event==='still-matte-ready')this.metrics.stillModel={id:stillId,status:'ready',provider:event.provider,warmupMs:event.warmupMs};
@@ -661,7 +663,7 @@ class RvmService {
       this.modelsInitializing=true;
       try {
       if(!this.fixture){const options=this.workerOptions();this.models=new ModelManager({dataRoot:this.dataRoot,bundledRoot:path.dirname(options.model),probe:(model,device)=>runModelProbe(this.workerOptions(),model,device,this.modelAbort.signal)});try{await this.models.initialize();}catch(error){this.modelManagerError=error.message;this.models=null;}
-        this.stillModels=new ModelManager({dataRoot:this.dataRoot,bundledRoot:path.dirname(options.model),catalogue:stillCatalog,settingsName:'still-model-selection.json',probe:model=>runStillProbe(this.workerOptions(),model,this.stillDeadlineMs(),this.modelAbort.signal)});try{await this.stillModels.initialize();}catch(error){this.stillModelError=error.message;this.stillModels=null;}}
+        this.stillModels=new ModelManager({dataRoot:this.dataRoot,bundledRoot:path.dirname(options.model),catalogue:stillCatalog,settingsName:'still-model-selection.json',probe:model=>stillCatalog.models.some(item=>item.architecture==='rvm'&&item.file&&path.basename(model)===item.file)?runStillRvmProbe(this.workerOptions(),model,this.modelAbort.signal):runStillProbe(this.workerOptions(),model,this.stillDeadlineMs(),this.modelAbort.signal)});try{await this.stillModels.initialize();}catch(error){this.stillModelError=error.message;this.stillModels=null;}}
       }finally{this.modelsInitializing=false;}
       await this.startWorker().catch(async error => {
         const live=this.models&&this.models.active.id!==this.models.catalogue.defaultModel,still=this.stillModels&&this.stillModels.active.id!==this.stillModels.catalogue.defaultModel;

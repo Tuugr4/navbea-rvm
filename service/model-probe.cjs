@@ -16,4 +16,14 @@ function runStillProbe(options,model,deadlineMs,signal){
   resolve(result);
  }));
 }
-module.exports={runModelProbe,runStillProbe};
+// A larger RVM for photos replaces the native pass (no parallel run, no deadline): probe the live model with it.
+function runStillRvmProbe(options,model,signal){
+ return new Promise((resolve,reject)=>execFile(options.python,['-I','-B',options.script,'--model',options.model,'--still-rvm-model',model,'--device','cpu','--threads',String(Math.max(1,require('node:os').availableParallelism?.()||2)),'--still-max-edge',String(options.stillMaxEdge||1024),'--check-model'],{windowsHide:true,timeout:180000,maxBuffer:1024*1024,signal},(error,stdout,stderr)=>{
+  if(error)return reject(Error('Fotoğraf modeli bu bilgisayarda çalıştırılamadı. '+String(stderr||error.message).slice(-600)));
+  let result;
+  try{result=JSON.parse(stdout.trim().split(/\r?\n/).at(-1));if(!result.verified)throw Error('Model doğrulanmadı');}catch{return reject(Error('Fotoğraf modeli testi geçerli sonuç vermedi.'));}
+  if(!(result.probeMs<=30000))return reject(Error(`Bu bilgisayarda test ${(result.probeMs/1000).toFixed(1)} sn sürdü; fotoğraf için çok yavaş. Mevcut model korunuyor.`));
+  resolve(result);
+ }));
+}
+module.exports={runModelProbe,runStillProbe,runStillRvmProbe};

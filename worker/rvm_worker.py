@@ -153,7 +153,7 @@ class RvmEngine:
 
 
 class OnnxRvmEngine:
-    def __init__(self, model_path: Path, device_mode: str = "auto", downsample_ratio: float = 0.375, still_ratio: float = 0.5, threads: int = 0, still_max_edge: int = 1024, still_threads: int = 0, still_warmup: int = 4):
+    def __init__(self, model_path: Path, device_mode: str = "auto", downsample_ratio: float = 0.375, still_ratio: float = 0.5, threads: int = 0, still_max_edge: int = 1024, still_threads: int = 0, still_warmup: int = 4, still_rvm_model: Path | None = None):
         import numpy as np
         import onnxruntime as ort
         from PIL import Image
@@ -190,6 +190,11 @@ class OnnxRvmEngine:
         self.primary_provider = self.session.get_providers()[0]
         self.cpu_session = None
         self.native_session = None
+        # A larger RVM (e.g. ResNet50) can matte the native photo while the live
+        # preview keeps the fast model; it runs as the native pass itself.
+        self.native_model_path = str(still_rvm_model) if still_rvm_model else self.model_path
+        self.native_model_name = Path(still_rvm_model).stem if still_rvm_model else None
+        self.native_input_types = self.input_types
         self.still_threads = still_threads or self.session_options.intra_op_num_threads
         self.downsample_ratio = np.asarray([downsample_ratio], dtype=np.float32)
         self.still_ratio = np.asarray([still_ratio], dtype=np.float32)
@@ -217,11 +222,7 @@ class OnnxRvmEngine:
             trim = self.ort.RunOptions()
             trim.only_execute_path_to_fetches = True
             trim.add_run_config_entry("memory.enable_memory_arena_shrinkage", "cpu:0")
-            self.native_session.run(["pha"], {
-                "src": self.np.zeros((1, 3, 128, 128), dtype=self.tensor_dtype),
-                "r1i": self.rec[0], "r2i": self.rec[1], "r3i": self.rec[2], "r4i": self.rec[3],
-                "downsample_ratio": self.still_ratio,
-            }, trim)
+            self.native_session.run(["pha"], self._feeds(self.np.zeros((1, 3, 128, 128), dtype=self.tensor_dtype), self.rec, self.still_ratio, self.native_input_types), trim)
 
     def _cpu(self):
         if self.cpu_session is None:
@@ -229,7 +230,7 @@ class OnnxRvmEngine:
         return self.cpu_session
 
     def _native(self):
-        if self.primary_provider == "CUDAExecutionProvider":
+        if self.primary_provider == "CUDAExecutionProvider" and self.native_model_name is None:
             return self.session
         if self.native_session is None:
             register_native_allocator(self.ort)
@@ -243,13 +244,16 @@ class OnnxRvmEngine:
             options.enable_mem_pattern = False
             options.add_session_config_entry("session.intra_op.allow_spinning", "0")
             options.add_session_config_entry("session.use_env_allocators", "1")
-            self.native_session = self.ort.InferenceSession(self.model_path, sess_options=options, providers=["CPUExecutionProvider"])
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if self.primary_provider == "CUDAExecutionProvider" else ["CPUExecutionProvider"]
+            self.native_session = self.ort.InferenceSession(self.native_model_path, sess_options=options, providers=providers)
+            self.native_input_types = {item.name: item.type for item in self.native_session.get_inputs()}
         return self.native_session
 
-    def _feeds(self, src, rec, ratio):
+    def _feeds(self, src, rec, ratio, types=None):
         feeds = {"src": src, "r1i": rec[0], "r2i": rec[1], "r3i": rec[2], "r4i": rec[3], "downsample_ratio": ratio}
+        types = types or self.input_types
         for name, value in feeds.items():
-            dtype = self.np.float16 if self.input_types.get(name) == "tensor(float16)" else self.np.float32
+            dtype = self.np.float16 if types.get(name) == "tensor(float16)" else self.np.float32
             if value.dtype != dtype:
                 feeds[name] = value.astype(dtype, copy=False)
         return feeds
@@ -268,11 +272,14 @@ class OnnxRvmEngine:
         src *= 1.0 / 255.0
         one = self.np.asarray([1.0], dtype=self.np.float32)
         for _ in range(self.still_warmup):
-            rec = session.run(["r1o", "r2o", "r3o", "r4o"], self._feeds(src, rec, one), self.run_options)
+            rec = session.run(["r1o", "r2o", "r3o", "r4o"], self._feeds(src, rec, one, self._types(session)), self.run_options)
         return rec
 
+    def _types(self, session):
+        return self.native_input_types if session is self.native_session else self.input_types
+
     def _run(self, session, src, rec, ratio=None):
-        feeds = self._feeds(src, rec, self.downsample_ratio if ratio is None else ratio)
+        feeds = self._feeds(src, rec, self.downsample_ratio if ratio is None else ratio, self._types(session))
         if ratio is None:
             # Live subscribers consume alpha only. Do not fetch the full RGB
             # foreground output until a native still actually needs it.
@@ -344,6 +351,8 @@ class OnnxRvmEngine:
                 print(json.dumps({"event": "still-warmup-skipped", "error": str(error)[:200]}), file=sys.stderr, flush=True)
                 outputs = self._run(session, src, [self.np.zeros((1, 1, 1, 1), dtype=self.tensor_dtype) for _ in range(4)], ratio)
             del src
+            if self.native_model_name is not None:
+                self.last_still = {"model": self.native_model_name, "provider": session.get_providers()[0], "used": self.native_model_name, "totalMs": round((time.perf_counter() - started) * 1000)}
             if self.still_engine is not None:
                 alpha = self._still_alpha(job, width, height, started)
                 if alpha is not None:
@@ -541,6 +550,7 @@ def main() -> int:
     parser.add_argument("--still-threads", type=int, default=0)
     parser.add_argument("--still-warmup", type=int, choices=range(0, 9), default=4)
     parser.add_argument("--still-model", default="")
+    parser.add_argument("--still-rvm-model", default="")
     parser.add_argument("--still-device", choices=("auto", "cuda", "directml", "cpu"), default="auto")
     parser.add_argument("--still-deadline-ms", type=int, default=5000)
     parser.add_argument("--check-still-model", action="store_true")
@@ -563,7 +573,7 @@ def main() -> int:
     if args.check_still_model:
         return check_still_model(Path(args.still_model).resolve(), args.still_device, args.threads)
     model_path = Path(args.model).resolve()
-    engine = FixtureEngine() if args.fixture else OnnxRvmEngine(model_path, args.device, args.downsample_ratio, args.still_ratio, args.threads, args.still_max_edge, args.still_threads, args.still_warmup) if model_path.suffix.lower() == ".onnx" else RvmEngine(model_path, args.device, args.downsample_ratio)
+    engine = FixtureEngine() if args.fixture else OnnxRvmEngine(model_path, args.device, args.downsample_ratio, args.still_ratio, args.threads, args.still_max_edge, args.still_threads, args.still_warmup, Path(args.still_rvm_model).resolve() if args.still_rvm_model else None) if model_path.suffix.lower() == ".onnx" else RvmEngine(model_path, args.device, args.downsample_ratio)
     if not args.fixture:
         from PIL import Image
         sample = io.BytesIO()

@@ -19,7 +19,10 @@ and Soumyadip Sengupta and is distributed under GPL-3.0.
 The optional MobileNetV3 FP16 and ResNet50 FP16/FP32 ONNX models are downloaded
 only on request from the same official v1.0.0 release. Their exact sizes and
 SHA-256 checksums are recorded in `models/catalog.json`. These unmodified models
-are also GPL-3.0; they are not included in the default installer payload.
+are also GPL-3.0; they are not included in the default installer payload, except
+`rvm_resnet50_fp32.onnx` (SHA-256
+`25db300fcb6ee27f941a1b52c97856e8d1f13c7f35817f81a612f89af0e8a85c`), which ships
+as the optional photo matting model "RVM ResNet50" listed in `models/still-catalog.json`.
 
 ## BiRefNet photo matting models (optional)
 
