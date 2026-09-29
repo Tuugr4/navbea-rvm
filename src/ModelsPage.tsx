@@ -6,10 +6,12 @@ import StillModelsSection from './StillModelsSection';
 import type {StillBridge} from './StillModelsSection';
 import DeviceSection from './DeviceSection';
 import type {DeviceBridge} from './DeviceSection';
+import BenchmarkSection from './BenchmarkSection';
+import type {BenchmarkBridge} from './BenchmarkSection';
 type Health={status:string;version:string;errorCode?:string;error?:string;metrics:{threadMode?:string;maskFps:number;inferenceMs:number|null;device:string;lastStill?:{totalMs:number};providerFallback?:string|null}};
 type Model={maxNativePixels?:number;id:string;name:string;architecture:string;precision:string;bytes:number;bundled?:boolean;downloaded:boolean;active:boolean;recommended:boolean;memoryRecommended:boolean;recommendedMemoryGiB:number;note:string};
 type Models={available:boolean;error?:string;defaultModel:string;active:{id:string};models:Model[];switching:boolean;activeSessions:number;actualProvider?:string;hardware:{memoryGiB:number;freeMemoryGiB:number;logicalCores:number;platform:string;arch:string};download?:{id:string;phase:string;received:number;total:number;error?:string};lastError?:string|null;lastProbe?:{modelId:string;provider:string;precision:string;probeMs:number;nativeProvider?:string}};
-type Bridge=PreviewBridge&StillBridge&DeviceBridge&{health():Promise<Health>;models():Promise<Models>;modelAction(action:'download'|'activate'|'cancel',id?:string):Promise<Models>;openSource():Promise<void>;openUpstream():Promise<void>;openLicense():Promise<void>;openNotices():Promise<void>;openSourceOffer():Promise<void>;openData():Promise<void>};
+type Bridge=PreviewBridge&StillBridge&DeviceBridge&BenchmarkBridge&{health():Promise<Health>;models():Promise<Models>;modelAction(action:'download'|'activate'|'cancel',id?:string):Promise<Models>;openSource():Promise<void>;openUpstream():Promise<void>;openLicense():Promise<void>;openNotices():Promise<void>;openSourceOffer():Promise<void>;openData():Promise<void>};
 declare global{interface Window{rvm?:Bridge}}
 export default function ModelsPage(){
  const [previewActive,setPreviewActive]=useState(false);
@@ -23,6 +25,7 @@ export default function ModelsPage(){
   {(error||connectionError||models?.lastError||health?.error)&&<div className="notice" role="alert"><WarningCircle/><span>{error||connectionError||models?.lastError||health?.error}</span></div>}
   <section className="current-model"><div><span className="eyebrow">ETKİN MODEL</span><h2>{active?.name||'Mevcut model'}</h2><p>{active?.id===models?.defaultModel?'Paketle gelen MobileNetV3 FP32 · varsayılan profil':'Doğrulanmış isteğe bağlı model'}</p></div><div className="current-metrics"><span><small>Maske</small><strong>{health?.metrics.maskFps??'—'} FPS</strong></span><span><small>İşleme</small><strong>{health?.metrics.inferenceMs!=null?Math.round(health.metrics.inferenceMs)+' ms':'—'}</strong></span><span><small>Çalışma ortamı</small><strong>{health?.metrics.device?.replace('ExecutionProvider','')||'—'}</strong></span></div></section>
   <DeviceSection bridge={bridge} disabled={!!pending||previewActive||!!models?.switching}/>
+  <BenchmarkSection bridge={bridge} disabled={!!pending||previewActive||!!models?.switching}/>
   <ForegroundPreview bridge={bridge} disabled={!!pending||!!models?.switching} onActiveChange={setPreviewActive}/>
   <section className="model-section"><div className="section-heading"><h2>Model seçenekleri</h2><p>İndirme etkin modeli değiştirmez. Geçiş yalnızca çekim oturumu ve canlı önizleme kapalıyken, çalışma testi geçince yapılır.</p></div>
    {!!models?.activeSessions&&<p className="notice"><Info/>Aktif çekim oturumu var. Model geçişi için oturumun bitmesini bekle.</p>}

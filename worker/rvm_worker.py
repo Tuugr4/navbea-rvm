@@ -598,6 +598,45 @@ def check_still_model(model_path: Path, device_mode: str, threads: int) -> int:
     return 0
 
 
+def benchmark(engine, selector, size: str) -> dict:
+    """Times the configured pipeline on synthetic frames: live mask, photo mask at the camera's photo size, and
+    person scoring. Content does not change these timings, so no camera or customer image is needed."""
+    import numpy as np
+    from PIL import Image
+    width, height = (int(v) for v in size.lower().split("x"))
+    def jpeg(w, h):
+        rng = np.random.default_rng(7)
+        y, x = np.mgrid[0:h, 0:w]
+        base = np.stack([x * 255 // max(1, w - 1), y * 255 // max(1, h - 1), (x + y) * 127 // max(1, w + h)], -1).astype(np.int16)
+        pixels = np.clip(base + rng.integers(-20, 20, base.shape), 0, 255).astype(np.uint8)
+        buffer = io.BytesIO(); Image.fromarray(pixels).save(buffer, "JPEG", quality=92); return buffer.getvalue()
+    def timed(action):
+        started = time.perf_counter(); action(); return (time.perf_counter() - started) * 1000
+    result = {"liveProvider": getattr(engine, "primary_provider", None), "photoProvider": engine.native_provider() if isinstance(engine, OnnxRvmEngine) else None,
+              "photoModel": getattr(engine, "native_model_name", None), "photoSize": [width, height]}
+    live = jpeg(1280, 720)
+    for _ in range(5): engine.process(live)
+    samples = sorted(timed(lambda: engine.process(live)) for _ in range(40))
+    result["live"] = {"meanMs": round(sum(samples) / len(samples), 1), "p95Ms": round(samples[int(len(samples) * .95) - 1], 1), "fps": round(1000 / (sum(samples) / len(samples)), 1)}
+    engine.reset()
+    still = getattr(engine, "still_engine", None)
+    if still is not None: still.ready.wait(120)
+    photo = jpeg(width, height); runs = []
+    for _ in range(4):
+        runs.append(timed(lambda: engine.process(photo, native=True))); engine.reset()
+    result["photo"] = {"firstSeconds": round(runs[0] / 1000, 2), "seconds": round(sorted(runs[1:])[1] / 1000, 2), "runsSeconds": [round(r / 1000, 2) for r in runs]}
+    if still is not None: result["photo"]["stillModel"] = {"name": still.name, "provider": still.provider, "report": getattr(engine, "last_still", None), "error": still.error}
+    if isinstance(engine, OnnxRvmEngine): result["photoProvider"] = engine.native_provider()
+    if selector is not None:
+        image = Image.open(io.BytesIO(photo)).convert("RGB")
+        detect = sorted(timed(lambda: selector.detector.detect(image, True)) for _ in range(3))[1]
+        entry = {"detectMs": round(detect)}
+        if selector.scorer is not None:
+            entry["scoreMs"] = round(sorted(timed(lambda: selector.scorer.observe(image, 364)) for _ in range(3))[1])
+        result["subjects"] = entry
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=os.environ.get("RVM_MODEL_PATH", ""))
@@ -622,6 +661,7 @@ def main() -> int:
     parser.add_argument("--startup-id", default="")
     parser.add_argument("--check-runtime", action="store_true")
     parser.add_argument("--check-model", action="store_true")
+    parser.add_argument("--benchmark", default="", help="WIDTHxHEIGHT of the camera photo: time the configured pipeline and exit")
     parser.add_argument("--inspect-runtime", action="store_true")
     args = parser.parse_args()
     if args.inspect_runtime:
@@ -673,6 +713,12 @@ def main() -> int:
         selector.detector.detect(Image.new("RGB", (128, 128)))
         if scorer: scorer.observe(Image.new("RGB", (128, 72)), 252)
     import onnxruntime as _ort
+    if args.benchmark:
+        started = time.perf_counter()
+        report = benchmark(engine, selector, args.benchmark)
+        report["totalSeconds"] = round(time.perf_counter() - started, 1)
+        print(json.dumps({"benchmark": report}), flush=True)
+        return 0
     print(json.dumps({"event": "rvm-ready", "protocol": 1, "startupId": args.startup_id,
                       "inferenceVerified": not args.fixture, "provider": getattr(engine, "primary_provider", args.device),
                       "photoProvider": engine.native_provider() if isinstance(engine, OnnxRvmEngine) else None,

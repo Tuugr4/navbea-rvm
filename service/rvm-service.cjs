@@ -57,6 +57,20 @@ function cameraDataRoot(platform, env) {
 function json(res, status, payload) { const body = Buffer.from(JSON.stringify(payload)); res.writeHead(status, { "content-type": "application/json", "content-length": body.length, "cache-control": "no-store" }); res.end(body); }
 async function readJson(req) { const chunks = []; let length = 0; for await (const chunk of req) { length += chunk.length; if (length > MAX_CONTROL_BODY) throw new Error("Control body too large"); chunks.push(chunk); } return length ? JSON.parse(Buffer.concat(chunks).toString()) : {}; }
 
+function workerArgs(options) {
+  const args = [options.script, "--model", options.model, "--device", options.device || "auto"];
+  args.push("--downsample-ratio", String(options.liveRatio ?? 0.375), "--still-ratio", String(options.stillRatio ?? 0.5), "--threads", String(options.threads ?? 0));
+  args.push("--still-max-edge", String(options.stillMaxEdge ?? 1024));
+  args.push("--still-threads", String(options.stillThreads ?? 0));
+  if (options.subjectModel) args.push("--subject-model", options.subjectModel);
+  if (options.depthModel && options.faceModel) args.push("--depth-model", options.depthModel, "--face-model", options.faceModel);
+  if (options.stillRvmModel) args.push("--still-rvm-model", options.stillRvmModel);
+  args.push("--native-device", options.nativeDevice || "cpu");
+  if (options.stillModel) args.push("--still-model", options.stillModel, "--still-device", options.stillDevice || "auto", "--still-deadline-ms", String(options.stillDeadlineMs ?? 5000));
+  return args;
+}
+const unitLabel = provider => !provider ? "?" : provider === "CPUExecutionProvider" ? "işlemci" : provider === "DmlExecutionProvider" ? "ekran kartı (DirectML)" : provider === "CUDAExecutionProvider" ? "ekran kartı (CUDA)" : String(provider).replace("ExecutionProvider", "");
+
 class PythonWorker {
   constructor(options) { this.options = options; this.child = null; this.decoder = new FrameDecoder(); this.pending = new Map(); this.onMask = null; this.onExit = null; this.onFailure = null; }
   failPending(error) {
@@ -65,16 +79,7 @@ class PythonWorker {
   }
   start() {
     const startupId = crypto.randomUUID();
-    const args = [this.options.script, "--model", this.options.model, "--device", this.options.device || "auto"];
-    args.push("--startup-id", startupId);
-    args.push("--downsample-ratio", String(this.options.liveRatio ?? 0.375), "--still-ratio", String(this.options.stillRatio ?? 0.5), "--threads", String(this.options.threads ?? 0));
-    args.push("--still-max-edge", String(this.options.stillMaxEdge ?? 1024));
-    args.push("--still-threads", String(this.options.stillThreads ?? 0));
-    if (this.options.subjectModel) args.push("--subject-model", this.options.subjectModel);
-    if (this.options.depthModel && this.options.faceModel) args.push("--depth-model", this.options.depthModel, "--face-model", this.options.faceModel);
-    if (this.options.stillRvmModel) args.push("--still-rvm-model", this.options.stillRvmModel);
-    args.push("--native-device", this.options.nativeDevice || "cpu");
-    if (this.options.stillModel) args.push("--still-model", this.options.stillModel, "--still-device", this.options.stillDevice || "auto", "--still-deadline-ms", String(this.options.stillDeadlineMs ?? 5000));
+    const args = [...workerArgs(this.options), "--startup-id", startupId];
     this.child = spawn(this.options.python, args, { windowsHide: true, shell: false, stdio: ["pipe", "pipe", "pipe"], env: { ...process.env, PYTHONUNBUFFERED: "1" } });
     this.child.stdout.on("data", chunk => {
       try { for (let frame of this.decoder.push(chunk)) {
@@ -180,7 +185,10 @@ class RvmService {
     this.resetPromise = null; this.stillTask = null; this.workerStartPromise = null; this.idleTimer = null;
     this.modelAbort=new AbortController();
     this.preview = new LivePreview(this);
+    this.events = []; this.lastBenchmark = null; this.benchmarkRunning = false;
   }
+  /** Recent engine events (starts, device/model changes, fallbacks, photo timings, tests) for the RVM window and the CMS. */
+  event(type, message, data = {}) { this.events.push({ at: new Date().toISOString(), type, message, ...data }); if (this.events.length > 60) this.events.splice(0, this.events.length - 60); }
   async ensureStorage() {
     await fsp.mkdir(this.dataRoot, { recursive: true, mode: 0o755 });
     const load = async (target, value) => { if (value) return value; const mode = this.platform !== "win32" && path.basename(target) === "client-token.txt" ? 0o644 : 0o600; try { const existing = (await fsp.readFile(target, "utf8")).trim(); if (existing.length < 32) throw new Error("Invalid local service credential"); if (this.platform !== "win32") await fsp.chmod(target, mode); return existing; } catch (error) { if (error.code !== "ENOENT") throw error; } const created = crypto.randomBytes(48).toString("base64url"); await fsp.writeFile(target, `${created}\n`, { mode, flag: "wx" }); return created; };
@@ -252,10 +260,11 @@ class RvmService {
     this.metrics.threads = profile.threads; this.metrics.threadMode = profile.mode;
     this.metrics.availableProcessors = profile.cpu.available; this.metrics.physicalCores = profile.cpu.physical;
     this.metrics.device = options.device;
+    this.lastWorkerOptions = { ...options };
     this.worker = new PythonWorker(options);
     const worker = this.worker;
-    worker.onProvider=(provider,reason)=>{if(this.worker!==worker)return;this.metrics.device=provider;this.metrics.providerFallback=reason||null;};
-    worker.onPhotoProvider=(provider,reason)=>{if(this.worker!==worker)return;this.metrics.photoProvider=provider;this.metrics.photoFallback=reason||null;};
+    worker.onProvider=(provider,reason)=>{if(this.worker!==worker)return;this.metrics.device=provider;this.metrics.providerFallback=reason||null;if(reason)this.event('fallback',`Canlı maske ${unitLabel(provider)} ile devam ediyor: ${reason}`);};
+    worker.onPhotoProvider=(provider,reason)=>{if(this.worker!==worker)return;this.metrics.photoProvider=provider;this.metrics.photoFallback=reason||null;this.event('fallback',`Fotoğraf maskesi ${unitLabel(provider)} ile devam ediyor: ${reason||''}`);};
     worker.onReady=event=>{if(this.worker!==worker)return;this.metrics.photoProvider=event.photoProvider||null;this.metrics.adapter=event.adapter||null;this.metrics.photoFallback=null;};
     const stillId=options.stillModel||options.stillRvmModel?this.stillModels.active.id:null;
     // A larger RVM for photos runs as the native pass itself: nothing loads in the background.
@@ -267,7 +276,7 @@ class RvmService {
       else if(event.event==='still-matte'){const {event:_event,...matte}=event;this.metrics.lastStillMatte={...matte,at:new Date().toISOString()};}
     };
     worker.onMask = frame => { if (this.worker === worker) this.acceptMask(frame); };
-    worker.onFailure = error => { if (this.worker !== worker) return; this.workerFailure = error; this.status = "unavailable"; this.errorCode = "RVM_WORKER_PIPE_FAILED"; this.error = error.message; };
+    worker.onFailure = error => { if (this.worker !== worker) return; this.event('error', 'Görüntü motoru hatası: ' + error.message); this.workerFailure = error; this.status = "unavailable"; this.errorCode = "RVM_WORKER_PIPE_FAILED"; this.error = error.message; };
     const startedAt = Date.now();
     worker.onExit = code => { if (this.worker !== worker) return; if (Date.now() - startedAt > 120_000) this.workerRestarts = 0; this.worker = null; this.scheduleWorkerRestart(new Error(`RVM worker exited (${code})`)); };
     try { await worker.start(); }
@@ -276,6 +285,7 @@ class RvmService {
     this.loadedModelId=this.models?.active.id;this.loadedStillModelId=this.stillModels?.active.id;
     this.workerFailure = null;
     this.status = "ready"; this.errorCode = null; this.error = null;
+    this.event('start', `Görüntü motoru hazır · canlı maske: ${unitLabel(this.metrics.device)} · fotoğraf maskesi: ${unitLabel(this.metrics.photoProvider)}${this.metrics.adapter ? ' · ' + this.metrics.adapter : ''}`, { liveModel: this.models?.active.id || null, stillModel: this.stillModels?.active.id || null, startupMs: Date.now() - startedAt });
   }
   cameraRequest(method, pathname, body, authorization) {
     const payload = body === undefined ? null : Buffer.from(JSON.stringify(body));
@@ -373,7 +383,7 @@ class RvmService {
       && !this.stopping && !this.modelChange && !this.modelsInitializing && !this.pipelinePreparing && !this.resetPromise
       && !this.stillTask && !this.workerStartPromise && !this.sourceStartPromise && !this.sessions.size && !this.subjectOwner);
   }
-  health() { return { status: this.status, readiness: { canRetryOpenSession: this.canRetryOpenSession() }, service: "rvm", sourceTimestamps: "camera-monotonic", version: VERSION, build: buildInfo, apiVersion: API_VERSION, uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000), errorCode: this.errorCode, error: this.error, sourceSession: this.sourceSession?.id || null, workerState: this.worker ? (this.stillCaptureBusy ? "native" : this.resetPromise ? "resetting" : "warm") : this.fixture ? "fixture" : "idle", modelSha256: this.workerProfile?.modelHash || null, metrics: { frames: this.metrics.frames, dropped: this.metrics.dropped, maskFps: this.metrics.maskFps, inferenceMs: this.metrics.inferenceMs === null ? null : Number(this.metrics.inferenceMs.toFixed(2)), device: this.metrics.device, threads: this.metrics.threads ?? null, threadMode: this.metrics.threadMode ?? null, availableProcessors: this.metrics.availableProcessors ?? null, physicalCores: this.metrics.physicalCores ?? null, cpuBudget: this.workerProfile?.budget ?? null, stillThreads: this.metrics.stillThreads ?? null, stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), stillRatio: Number(this.env.RVM_STILL_RATIO || .5), lastStill: this.metrics.lastStill || null, stillModel: this.metrics.stillModel || null, stillDeadlineMs: this.stillDeadlineMs(), lastStillMatte: this.metrics.lastStillMatte || null, lastStartup: this.metrics.lastStartup || null } }; }
+  health() { return { status: this.status, readiness: { canRetryOpenSession: this.canRetryOpenSession() }, service: "rvm", sourceTimestamps: "camera-monotonic", version: VERSION, build: buildInfo, apiVersion: API_VERSION, uptimeSeconds: Math.round((Date.now() - this.startedAt) / 1000), errorCode: this.errorCode, error: this.error, sourceSession: this.sourceSession?.id || null, workerState: this.worker ? (this.stillCaptureBusy ? "native" : this.resetPromise ? "resetting" : "warm") : this.fixture ? "fixture" : "idle", modelSha256: this.workerProfile?.modelHash || null, metrics: { frames: this.metrics.frames, dropped: this.metrics.dropped, maskFps: this.metrics.maskFps, inferenceMs: this.metrics.inferenceMs === null ? null : Number(this.metrics.inferenceMs.toFixed(2)), device: this.metrics.device, threads: this.metrics.threads ?? null, threadMode: this.metrics.threadMode ?? null, availableProcessors: this.metrics.availableProcessors ?? null, physicalCores: this.metrics.physicalCores ?? null, cpuBudget: this.workerProfile?.budget ?? null, stillThreads: this.metrics.stillThreads ?? null, stillMaxEdge: Number(this.env.RVM_STILL_MAX_EDGE || 1024), stillRatio: Number(this.env.RVM_STILL_RATIO || .5), lastStill: this.metrics.lastStill || null, stillModel: this.metrics.stillModel || null, stillDeadlineMs: this.stillDeadlineMs(), lastStillMatte: this.metrics.lastStillMatte || null, lastStartup: this.metrics.lastStartup || null }, processing: { mode: this.deviceMode || null, liveModel: this.loadedModelId || null, stillModel: this.loadedStillModelId || null, photoProvider: this.metrics.photoProvider || null, adapter: this.metrics.adapter || null, photoFallback: this.metrics.photoFallback || null }, benchmark: this.lastBenchmark, benchmarkRunning: this.benchmarkRunning, recentEvents: this.events.slice(-15) }; }
   authorized(req,role='client') { const a = Buffer.from(String(req.headers[role==='admin'?'x-navbea-admin-token':"x-navbea-client-token"] || "")); const secret=role==='admin'?this.adminSecret:this.clientSecret; if(!secret)return false;const b = Buffer.from(String(secret)); return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b); }
   modelsStatus(){if(this.modelsInitializing)return{available:false,error:'Modeller kontrol ediliyor.'};if(!this.models)return{available:false,error:'Model yönetimi henüz hazır değil.'};const status=this.models.snapshot();const activeId=this.loadedModelId||status.active.id;return {...status,available:true,active:{...status.active,id:activeId},models:status.models.map(item=>({...item,active:item.id===activeId})),switching:Boolean(this.modelChange)||status.switching,activeSessions:this.sessions.size,actualProvider:this.metrics.device};}
   changeModel(id){return this.lifecycle(async()=>{
@@ -385,7 +395,7 @@ class RvmService {
       const cameraHealth=await this.cameraRequest('GET','/v1/health').catch(()=>null);const native=cameraHealth?.nativeStill;
       if(cameraHealth?.operationState)throw Error('Kamera bir işlem yürütüyor. Model değişimi için kamera testinin veya çekimin bitmesini bekleyin.');
       if(native?.width*native?.height>this.models.limits(id).maxNativePixels)throw Error('Bu model seçili kameranın fotoğraf çözünürlüğü için doğrulanmış sınırı aşıyor. Mevcut modeli kullanın.');
-      await this.models.activate(id);if(previous.id===this.models.active.id)return this.modelsStatus();
+      await this.models.activate(id);if(previous.id===this.models.active.id)return this.modelsStatus();this.event('settings','Canlı model değişti: '+id);
       this.worker?.stop();this.worker=null;this.workerProfile=null;this.workerRestarts=0;
       try{await this.startWorker();}
       catch(error){await this.models.restore(previous,'Yeni model başlatılamadı; önceki model geri yüklendi. '+error.message);this.worker?.stop();this.worker=null;this.workerProfile=null;await this.startWorker();throw error;}
@@ -416,11 +426,37 @@ class RvmService {
     const previous=this.deviceMode;this.modelChange=true;
     const restart=async()=>{this.worker?.stop();this.worker=null;this.workerProfile=null;this.workerRestarts=0;await this.startWorker();};
     try{
-      await this.saveDeviceMode(mode);
+      await this.saveDeviceMode(mode);this.event('settings','İşlem birimi: '+({auto:'Otomatik',gpu:'Ekran kartı',cpu:'İşlemci'})[mode]);
       try{await restart();if(mode==='gpu'&&this.metrics.device==='CPUExecutionProvider')throw Error('Ekran kartı başlatılamadı; bu bilgisayarda uyumlu bir GPU sürücüsü bulunamadı.');}
       catch(error){if(previous)await this.saveDeviceMode(previous);else{await fsp.unlink(path.join(this.dataRoot,'device-selection.json')).catch(()=>{});this.deviceMode=null;}await restart().catch(()=>{});throw Error(error.message+' Önceki ayar geri yüklendi.');}
       return this.deviceStatus();
     }finally{this.modelChange=false;}
+  });}
+  benchmarkStatus(){return {running:this.benchmarkRunning,last:this.lastBenchmark};}
+  async loadBenchmark(){try{this.lastBenchmark=JSON.parse(await fsp.readFile(path.join(this.dataRoot,'benchmark-last.json'),'utf8'));}catch{this.lastBenchmark=null;}}
+  /** "Test et": stops the live worker, times the configured pipeline in a separate run, then restarts the worker. */
+  runBenchmark(){return this.lifecycle(async()=>{
+    if(this.fixture)throw Error('Test bu çalışma modunda yapılamaz.');
+    if(this.preview.active)throw Error('Test için canlı önizlemeyi kapatın.');
+    if(this.sessions.size||this.stillTask||this.resetPromise||this.workerStartPromise||this.modelChange)throw Error('Test için aktif çekim oturumunun bitmesini bekleyin.');
+    if(!this.lastWorkerOptions)await this.ensureWorker();
+    const options={...this.lastWorkerOptions};
+    const camera=await this.cameraRequest('GET','/v1/health').catch(()=>null);const native=camera?.nativeStill;
+    const size=native?.width>0&&native?.height>0?`${native.width}x${native.height}`:'1920x1080';
+    this.modelChange=true;this.benchmarkRunning=true;const startedAt=Date.now();
+    this.worker?.stop();this.worker=null;
+    try{
+      const report=await new Promise((resolve,reject)=>execFile(options.python,['-I','-B',...workerArgs(options),'--benchmark',size],{windowsHide:true,timeout:300000,maxBuffer:4*1024*1024},(error,stdout,stderr)=>{
+        if(error)return reject(Error('Test tamamlanamadı: '+String(stderr||error.message).trim().split(/\r?\n/).slice(-2).join(' ').slice(0,400)));
+        try{resolve(JSON.parse(stdout.trim().split(/\r?\n/).at(-1)).benchmark);}catch{reject(Error('Test sonucu okunamadı.'));}
+      }));
+      const status=await this.deviceStatus().catch(()=>null);
+      this.lastBenchmark={at:new Date().toISOString(),durationSeconds:Math.round((Date.now()-startedAt)/1000),size,mode:this.deviceMode||status?.mode||null,liveModel:this.models?.active.id||null,stillModel:this.stillModels?.active.id||null,cpu:status?.hardware.cpu.name||null,gpu:status?.hardware.gpus.find(item=>item.inUse)?.name||null,...report};
+      await fsp.writeFile(path.join(this.dataRoot,'benchmark-last.json'),JSON.stringify(this.lastBenchmark));
+      this.event('benchmark',`Test: canlı maske ${report.live.meanMs} ms (${report.live.fps} FPS, ${unitLabel(report.liveProvider)}) · fotoğraf maskesi ${report.photo.seconds} sn (ilk ${report.photo.firstSeconds} sn, ${unitLabel(report.photoProvider)}, ${size})${report.subjects?` · kişi seçimi ${((report.subjects.detectMs+(report.subjects.scoreMs||0))/1000).toFixed(1)} sn`:''}`);
+      return this.benchmarkStatus();
+    }catch(error){this.event('error',error.message);throw error;}
+    finally{this.benchmarkRunning=false;this.modelChange=false;this.workerRestarts=0;await this.startWorker().catch(error=>this.scheduleWorkerRestart(error));}
   });}
   stillModelsStatus(){if(this.modelsInitializing)return{available:false,error:'Modeller kontrol ediliyor.'};if(!this.stillModels)return{available:false,error:this.stillModelError||'Fotoğraf maskesi modelleri hazır değil.'};const status=this.stillModels.snapshot();const activeId=this.loadedStillModelId||status.active.id;return {...status,available:true,active:{...status.active,id:activeId},models:status.models.map(item=>({...item,active:item.id===activeId})),switching:Boolean(this.modelChange)||status.switching,activeSessions:this.sessions.size,deadlineMs:this.stillDeadlineMs(),runtime:this.metrics.stillModel||null,lastStillMatte:this.metrics.lastStillMatte||null};}
   changeStillModel(id){return this.lifecycle(async()=>{
@@ -429,7 +465,7 @@ class RvmService {
     if(this.sessions.size||this.stillTask||this.resetPromise||this.workerStartPromise)throw Error('Model değiştirmek için aktif çekim oturumunun bitmesini bekleyin.');
     const previous={...this.stillModels.active};this.modelChange=true;
     try{
-      await this.stillModels.activate(id);if(previous.id===this.stillModels.active.id)return this.stillModelsStatus();
+      await this.stillModels.activate(id);if(previous.id===this.stillModels.active.id)return this.stillModelsStatus();this.event('settings','Fotoğraf modeli değişti: '+id);
       if(!this.worker)return this.stillModelsStatus();
       this.worker.stop();this.worker=null;this.workerRestarts=0;
       try{await this.startWorker();}
@@ -611,6 +647,7 @@ class RvmService {
     if (mask.payload.length !== mask.width * mask.height) throw new Error("Invalid native mask length");
     const timings = { sourceReadMs: Math.round(sourceReadMs), queueMs: Math.round(queueMs), workerAndDecodeMs: Math.round(performance.now() - queueStartedAt - queueMs), totalMs: Math.round(performance.now() - startedAt), inputBytes: source.payload.length, maskBytes: mask.payload.length, foregroundBytes: foregroundArtifact?.byteLength || 0, serviceRssBytes: process.memoryUsage().rss };
     this.metrics.lastStill = { captureId: cameraArtifact.captureId || cameraArtifact.id, ...timings };
+    this.event('photo', `Fotoğraf maskesi ${(timings.totalMs / 1000).toFixed(1)} sn${this.metrics.lastStillMatte?.used ? ' · ' + this.metrics.lastStillMatte.used : ''}`, { totalMs: timings.totalMs });
     const id = crypto.randomUUID(), exp = Math.floor(Date.now() / 1000) + 120;
     const artifact = { id, payload: mask.payload, width: mask.width, height: mask.height, byteLength: mask.payload.length, mimeType: "application/x-navbea-gray8", expiresAt: new Date(exp * 1000).toISOString() };
     artifact.readCapability = signCapability({ aud: "rvm", scope: "artifact:read", artifact: id, exp }, this.capabilitySecret);
@@ -639,6 +676,9 @@ class RvmService {
       }
       if(req.method==='GET'&&url.pathname==='/v1/still-models')return json(res,200,this.stillModelsStatus());
       if(req.method==='GET'&&url.pathname==='/v1/device')return json(res,200,await this.deviceStatus());
+      if(req.method==='GET'&&url.pathname==='/v1/events')return json(res,200,{events:this.events});
+      if(req.method==='GET'&&url.pathname==='/v1/benchmark')return json(res,200,this.benchmarkStatus());
+      if(req.method==='POST'&&url.pathname==='/v1/benchmark')return json(res,200,await this.runBenchmark());
       if(req.method==='POST'&&url.pathname==='/v1/device/activate'){
         if(!this.authorized(req,'admin'))return json(res,403,{error:'İşlem birimi seçimi için yönetici izni gerekiyor.'});
         return json(res,200,await this.changeDevice((await readJson(req)).id));
@@ -688,6 +728,7 @@ class RvmService {
     if (this.platform !== "win32") await fsp.chmod(socketPath, 0o666);
   }
   scheduleWorkerRestart(error) {
+    if (!this.stopping) this.event('error', 'Görüntü motoru yeniden başlatılıyor: ' + error.message);
     this.status = "unavailable"; this.errorCode = "RVM_RUNTIME_UNAVAILABLE"; this.error = error.message;
     if (this.stopping || this.workerRestartTimer || this.workerRestarts >= 5) return;
     const delay = Math.min(30_000, 1000 * 2 ** this.workerRestarts++);
@@ -697,6 +738,7 @@ class RvmService {
     try {
       await this.ensureStorage();
       await this.loadDeviceMode();
+      await this.loadBenchmark();
       this.controlServer = http.createServer((req, res) => void this.handleControl(req, res)); this.streamServer = net.createServer(socket => this.handleStream(socket));
       await this.listen(this.controlServer, this.paths.control); await this.listen(this.streamServer, this.paths.stream);
       this.modelsInitializing=true;

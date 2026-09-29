@@ -13,3 +13,19 @@
 .device-section .model-card.selected{border-color:#1a1a18}
 .device-section .model-title h3{display:flex;align-items:center;gap:8px}
 .device-apply{display:flex;gap:10px;margin:14px 0 4px}
+
+/* Test */
+.benchmark-section{margin-top:32px}
+.benchmark-result{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-top:16px}
+.benchmark-result>div{display:grid;gap:4px;padding:16px;border:1px solid #deded8;border-radius:12px;background:#fff}
+.benchmark-result small{font-size:12px;color:#6d6d66;text-transform:uppercase;letter-spacing:.04em}
+.benchmark-result strong{font-size:28px;font-variant-numeric:tabular-nums}
+.benchmark-result em{font-style:normal;font-size:13px;color:#5b5b55}
+.benchmark-result .hardware-line{grid-column:1/-1;margin:0}
+.engine-events{margin-top:16px;border:1px solid #deded8;border-radius:12px;background:#fff;padding:12px 16px}
+.engine-events summary{display:flex;align-items:center;gap:8px;font-weight:600;cursor:pointer}
+.engine-events ol{list-style:none;margin:12px 0 0;padding:0;display:grid;gap:6px;max-height:320px;overflow:auto}
+.engine-events li{display:grid;grid-template-columns:140px 1fr;gap:12px;font-size:13px}
+.engine-events time{color:#6d6d66;font-variant-numeric:tabular-nums}
+.engine-events .event-error span,.engine-events .event-fallback span{color:#a23b1c}
+.engine-events .event-benchmark span{font-weight:600}
