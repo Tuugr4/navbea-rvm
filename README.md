@@ -11,6 +11,8 @@ NVF1 binary stream and publishes sequence-aligned `GRAY8` alpha masks.
 - `worker/`: hermetic Python/TorchScript RVM inference worker.
 - `electron/` and `src/`: technician diagnostics UI.
 - `models/manifest.json`: release-pinned model metadata and checksum.
+- `docs/INTEGRATION.md`: how the kiosk and the Camera Service connect, step by
+  step. `npm run flow:check` runs the whole flow without camera hardware.
 
 Production packages must include the complete GPL-3.0 text, corresponding
 source archive, upstream copyright notices and the exact model checksum.

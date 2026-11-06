@@ -25,7 +25,12 @@ upstream model:
 - explicit camera-source retry eligibility, current-worker callback ownership
   and preservation of worker failures when late masks arrive;
 - an opt-in background-removed camera preview using sequence/timestamp-matched
-  JPEG and alpha frames, expiring viewer leases and no extra inference pass.
+  JPEG and alpha frames, expiring viewer leases and no extra inference pass;
+- a still matte requested right after the last live stream closed waits for
+  the pipeline reset instead of failing as busy;
+- a development Camera Service stand-in, an end-to-end guest-flow check
+  (`npm run flow:check`) and the documented integration contract in
+  `docs/INTEGRATION.md`.
 
 The upstream model architecture, training code and official weights are not
 represented as original Navbea work. Their authors and source are identified in

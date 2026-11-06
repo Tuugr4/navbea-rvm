@@ -14,7 +14,9 @@
     "test": "node --test service/*.test.cjs && node scripts/test-worker.mjs",
     "electron:make": "npm run build && electron-forge make",
     "source:build": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-corresponding-source.ps1",
-    "release:verify": "node scripts/verify-release.mjs"
+    "release:verify": "node scripts/verify-release.mjs",
+    "camera:dev": "cross-env NAVBEA_RUNTIME_DIR=.runtime/run NAVBEA_CAMERA_CLIENT_TOKEN=development-camera-token-000000000000000000000000 node scripts/dev-camera.cjs",
+    "flow:check": "node scripts/e2e-flow.cjs"
   },
   "dependencies": {
     "@phosphor-icons/react": "^2.1.10",
