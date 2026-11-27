@@ -600,7 +600,11 @@ class RvmService {
       throw error;
     }).finally(() => { if (this.resetPromise === work) this.resetPromise = null; });
   }
-  stillMatte(cameraArtifact, selection) {
+  async stillMatte(cameraArtifact, selection) {
+    // Closing the last mask stream resets the pipeline. A photo requested right
+    // after that (the guest walked to the capture step) waits for the reset
+    // instead of failing as busy; subject-selection resets keep their own rules.
+    if (this.resetPromise && !this.subjectOwner && !this.stillTask && !this.pipelinePreparing) await this.resetPromise.catch(() => undefined);
     if (this.subjectOwner && (selection?.sessionId !== this.subjectOwner || !this.subjectLock || selection?.lockId !== this.subjectLock)) return Promise.reject(new Error("Subject lock is required for native verification"));
     if (this.stillTask || this.resetPromise || this.pipelinePreparing) return Promise.reject(new Error("RVM native capture is busy"));
     const retainedBytes = [...this.artifacts.values()].reduce((sum, item) => sum + item.payload.length, 0);
